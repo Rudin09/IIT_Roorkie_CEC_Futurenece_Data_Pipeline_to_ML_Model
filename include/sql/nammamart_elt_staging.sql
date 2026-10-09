@@ -84,7 +84,7 @@ SELECT *, CASE WHEN payment_id IS NULL OR order_id IS NULL OR payment_ts IS NULL
        CASE WHEN payment_id IS NULL THEN 'payment_id missing' WHEN order_id IS NULL THEN 'order_id missing' WHEN payment_ts IS NULL THEN 'invalid payment_ts' WHEN payment_mode NOT IN ('UPI', 'Card', 'Cash on Delivery', 'Wallet') THEN 'invalid payment_mode' ELSE NULL END AS failure_reason
 FROM typed;
 
-CREATE OR REPLACE TABLE stg_orders AS
+CREATE OR REPLACE TABLE stg_orders_snapshot AS
 WITH ranked AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
     FROM raw_orders

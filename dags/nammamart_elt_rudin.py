@@ -103,6 +103,17 @@ def nammamart_elt_rudin():
         print(f"[Staging] SQL transformations complete for {len(raw_loads)} raw loads")
         return True
 
+    @task
+    def apply_order_upsert(staging_complete):
+        """MERGE the latest raw order version into persistent staging."""
+        context = get_current_context()
+        con = duckdb.connect(WAREHOUSE_DB)
+        _execute_sql(con, "nammamart_elt_orders_upsert.sql", context["run_id"], context["dag"].dag_id)
+        counts = con.execute("SELECT COUNT(*) AS total_orders, COUNT(*) FILTER (WHERE order_status = 'RETURNED') AS returned_orders FROM stg_orders").fetchone()
+        print(f"[Staging][MERGE] stg_orders={counts[0]} rows; returned={counts[1]}")
+        con.close()
+        return staging_complete
+
     # -------------------- DQ: persist SQL quality scorecard ------------------
     @task
     def record_dq_results(staging_complete):
@@ -135,7 +146,8 @@ def nammamart_elt_rudin():
     # window function applies the correction rows over the September snapshot.
     raw_orders >> raw_increment
     staging = build_staging(raw_orders, raw_increment, raw_payments, raw_customers, raw_products, raw_stores)
-    dq = record_dq_results(staging)
+    upserted = apply_order_upsert(staging)
+    dq = record_dq_results(upserted)
     build_marts(dq)
 
 
