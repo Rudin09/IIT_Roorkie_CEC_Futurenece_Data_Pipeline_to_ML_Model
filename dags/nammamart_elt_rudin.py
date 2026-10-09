@@ -23,7 +23,9 @@ from airflow.utils.context import get_current_context
 
 DATA_DIR = "/usr/local/airflow/include/data/nammamart"
 SQL_DIR = "/usr/local/airflow/include/sql"
-WAREHOUSE_DB = "/usr/local/airflow/include/warehouse_rudin.duckdb"
+# Keep ELT storage separate from the ETL warehouse so scheduled or manual runs
+# can execute side by side without DuckDB file-lock contention.
+WAREHOUSE_DB = "/usr/local/airflow/include/warehouse_rudin_elt.duckdb"
 
 default_args = {
     "owner": "fde-cohort",
@@ -60,9 +62,11 @@ def _load_csv_to_raw(filename: str, table_name: str) -> int:
 
 @dag(
     dag_id="nammamart_elt_rudin",
+    description="NammaMart SQL ELT pipeline; supports scheduled and manual runs.",
     schedule="0 9 * * 1-6",
     start_date=pendulum.datetime(2026, 9, 1, tz="Asia/Kolkata"),
     catchup=False,
+    max_active_runs=1,
     default_args=default_args,
     tags=["fde", "nammamart", "elt"],
 )

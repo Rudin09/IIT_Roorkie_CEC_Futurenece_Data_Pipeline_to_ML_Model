@@ -74,9 +74,11 @@ def _mask_phone(value: str) -> str:
 
 @dag(
     dag_id="nammamart_etl_rudin",
+    description="NammaMart Python ETL pipeline; supports scheduled and manual runs.",
     schedule="0 9 * * 1-6",
     start_date=pendulum.datetime(2026, 9, 1, tz="Asia/Kolkata"),
     catchup=False,
+    max_active_runs=1,
     default_args=default_args,
     tags=["fde", "nammamart", "etl"],
 )
