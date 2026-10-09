@@ -18,7 +18,7 @@ import duckdb
 import pandas as pd
 import pendulum
 from airflow.decorators import dag, task
-from airflow.utils.context import get_current_context
+from airflow.sdk import get_current_context
 from airflow.utils.trigger_rule import TriggerRule
 
 

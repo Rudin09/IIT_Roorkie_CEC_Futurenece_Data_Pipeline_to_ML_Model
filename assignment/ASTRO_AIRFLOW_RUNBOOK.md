@@ -43,7 +43,7 @@ Password: admin
 If the containers were already running, use:
 
 ```powershell
-astro dev status
+astro dev ps
 ```
 
 ## 3. Check DAG import and schedule from the command line
@@ -276,4 +276,3 @@ Do not delete the DuckDB warehouses, quarantine outputs, or screenshots until th
 - [ ] Payment reconciliation query result captured
 - [ ] Incremental run proves 10 updates and 150 inserts
 - [ ] Screenshots are stored under `assignment/evidence/`
-
