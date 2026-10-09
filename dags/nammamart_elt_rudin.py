@@ -132,6 +132,12 @@ def nammamart_elt_rudin():
     # -------------------- MART: SQL-only business tables ---------------------
     @task
     def build_marts(dq_complete):
+        """Build marts and return an audit success marker.
+
+        All ELT staging and DQ tasks are upstream of this task. The marker is
+        therefore sufficient for ``audit_run`` to determine overall success
+        without using Airflow's restricted metadata ORM inside a task.
+        """
         context = get_current_context()
         con = duckdb.connect(WAREHOUSE_DB)
         _execute_sql(con, "nammamart_elt_marts.sql", context["run_id"], context["dag"].dag_id)
@@ -139,6 +145,7 @@ def nammamart_elt_rudin():
             row_count = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
             print(f"[Mart] {table_name}: {row_count} rows")
         con.close()
+        return True
 
     # -------------------- AUDIT: always record the run outcome ---------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
@@ -167,11 +174,10 @@ def nammamart_elt_rudin():
             run_id VARCHAR, dag_id VARCHAR, start_time TIMESTAMP, end_time TIMESTAMP,
             rows_extracted BIGINT, rows_loaded BIGINT, rows_quarantined BIGINT, status VARCHAR
         )""")
-        upstream_failed = any(
-            item.task_id != context["task"].task_id
-            and item.state not in {"success", "skipped"}
-            for item in dag_run.get_task_instances()
-        )
+        # `build_marts` depends on the complete ELT transformation chain and
+        # returns a marker only when it completes successfully. This avoids
+        # direct metadata DB access, which Airflow 3 disallows from task code.
+        upstream_failed = task_instance.xcom_pull(task_ids="build_marts") is not True
         status = "failed" if upstream_failed else "success"
         con.execute("INSERT INTO pipeline_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
             dag_run.run_id, context["dag"].dag_id, dag_run.start_date,
@@ -187,9 +193,12 @@ def nammamart_elt_rudin():
     raw_stores = load_raw_stores()
     raw_increment = load_raw_increment()
 
-    # The increment is loaded after the base orders so staging's latest-record
-    # window function applies the correction rows over the September snapshot.
-    raw_orders >> raw_increment
+    # DuckDB permits one writer at a time. Serialize all raw-load tasks so
+    # concurrent workers cannot contend for the warehouse file lock. The
+    # increment remains immediately after the base orders so staging's latest-
+    # record window function applies correction rows over the September
+    # snapshot.
+    raw_orders >> raw_increment >> raw_payments >> raw_customers >> raw_products >> raw_stores
     staging = build_staging(raw_orders, raw_increment, raw_payments, raw_customers, raw_products, raw_stores)
     upserted = apply_order_upsert(staging)
     dq = record_dq_results(upserted)

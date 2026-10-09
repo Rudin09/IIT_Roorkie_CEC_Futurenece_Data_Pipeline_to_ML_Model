@@ -261,6 +261,12 @@ def nammamart_etl_rudin():
         payment_expected = payments["order_id"].map(order_amounts).pipe(pd.to_numeric, errors="coerce")
         payment_success = payments["payment_status"].str.strip().str.upper().eq("SUCCESS")
         payment_amount_mismatch = payment_success & payment_paid.notna() & payment_expected.notna() & ((payment_paid - payment_expected).abs() > 0.01)
+        # JSON/XCom round-tripping can infer an all-numeric PII column as a
+        # numeric dtype. Convert to pandas' nullable string dtype before using
+        # the string accessor so malformed source values become validation
+        # failures/warnings instead of crashing the task.
+        email_values = customers["email"].astype("string")
+        phone_values = customers["phone"].astype("string")
         dq_records = [
             _dq_row("required_fields", "Completeness", "Critical", len(orders) + len(payments) + len(customers) + len(products) + len(stores),
                     failed_count(orders, orders[["order_id", "order_ts", "customer_id", "store_id", "product_id"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(payments, payments[["payment_id", "order_id", "payment_ts", "amount_paid"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(customers, customers[["customer_id", "signup_date"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(products, products[["product_id", "category"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(stores, stores[["store_id", "zone"]].apply(lambda column: column.map(_blank)).any(axis=1)), run_id, dag_id),
@@ -269,7 +275,7 @@ def nammamart_etl_rudin():
             _dq_row("allowed_values_and_formats", "Validity", "Critical", len(orders) + len(payments),
                     failed_count(orders, ~order_status.isin(ALLOWED_STATUS), ~order_modes.isin(ALLOWED_PAYMENT_MODES), order_ts.isna()) + failed_count(payments, ~payment_modes.isin(ALLOWED_PAYMENT_MODES), pd.to_datetime(payments.payment_ts, errors="coerce").isna()), run_id, dag_id),
             _dq_row("pii_format", "Validity", "Warning", len(customers),
-                    failed_count(customers, ~customers.email.str.match(r"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"), ~customers.phone.str.match(r"^\\d{10}$")), run_id, dag_id),
+                    failed_count(customers, ~email_values.str.match(r"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", na=False), ~phone_values.str.match(r"^\\d{10}$", na=False)), run_id, dag_id),
             _dq_row("numeric_business_rules", "Accuracy", "Critical", len(orders) + len(products),
                     failed_count(orders, order_quantity.isna() | (order_quantity <= 0), order_discount.isna() | ~order_discount.between(0, 100), (order_amount - expected_amount).abs() > 0.01, order_delivery.notna() & (order_delivery >= 120)) + failed_count(products, pd.to_numeric(products.mrp, errors="coerce").isna() | (pd.to_numeric(products.mrp, errors="coerce") <= 0), pd.to_numeric(products.cost_price, errors="coerce") > pd.to_numeric(products.mrp, errors="coerce")), run_id, dag_id),
             _dq_row("foreign_keys_and_payment_match", "Consistency", "Critical", len(orders) + len(payments),
@@ -401,6 +407,12 @@ def nammamart_etl_rudin():
     # -------------------- REPORT: business-ready summary tables --------------
     @task
     def report():
+        """Build reporting tables and return an audit success marker.
+
+        The marker is consumed by ``audit_run``. Returning it lets the audit
+        task determine whether this critical branch completed without querying
+        Airflow's metadata database, which is not allowed from Airflow 3 tasks.
+        """
         con = duckdb.connect(WAREHOUSE_DB)
         con.execute("""
             CREATE OR REPLACE TABLE etl_daily_zone_revenue AS
@@ -421,6 +433,7 @@ def nammamart_etl_rudin():
         print(con.execute("SELECT * FROM etl_daily_zone_revenue LIMIT 10").fetchdf().to_string(index=False))
         print(con.execute("SELECT * FROM etl_category_margin").fetchdf().to_string(index=False))
         con.close()
+        return True
 
     # -------------------- AUDIT: always record the run outcome ---------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
@@ -445,11 +458,10 @@ def nammamart_etl_rudin():
             run_id VARCHAR, dag_id VARCHAR, start_time TIMESTAMP, end_time TIMESTAMP,
             rows_extracted BIGINT, rows_loaded BIGINT, rows_quarantined BIGINT, status VARCHAR
         )""")
-        upstream_failed = any(
-            item.task_id != context["task"].task_id
-            and item.state not in {"success", "skipped"}
-            for item in dag_run.get_task_instances()
-        )
+        # `report` depends on every critical ETL branch and returns a marker
+        # only when it completes successfully. This avoids direct metadata DB
+        # access, which Airflow 3 disallows from task code.
+        upstream_failed = task_instance.xcom_pull(task_ids="report") is not True
         status = "failed" if upstream_failed else "success"
         con.execute("INSERT INTO pipeline_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
             dag_run.run_id, context["dag"].dag_id, dag_run.start_date,

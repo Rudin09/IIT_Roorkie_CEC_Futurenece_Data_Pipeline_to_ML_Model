@@ -266,7 +266,69 @@ HAVING COUNT(*) > 1;
 
 Expected result: 160 raw increment rows, 10 corrected orders with their latest status, 150 new orders, and no duplicate `order_id` in `stg_orders`.
 
-## 11. Stop Astro/Airflow
+## 11. Troubleshoot failed or queued runs
+
+### Check the run and task states
+
+The DAG can be registered correctly and still fail during task execution. Check the latest run and then inspect the task states:
+
+```powershell
+astro dev run dags list-runs nammamart_etl_rudin -o json
+astro dev run dags list-runs nammamart_elt_rudin -o json
+
+astro dev run tasks states-for-dag-run nammamart_etl_rudin <run_id> -o json
+astro dev run tasks states-for-dag-run nammamart_elt_rudin <run_id> -o json
+```
+
+`queued` means the run is waiting for the scheduler; `running` means task execution has started; `success` means the complete DAG, including `audit_run`, finished successfully. Open the first task shown as `failed` in the Airflow UI and read its log. Tasks marked `upstream_failed` are usually consequences of an earlier failure.
+
+### ETL validation error involving `.str`
+
+If the ETL `validate` task reports:
+
+```text
+Can only use .str accessor with string values!
+```
+
+The source CSV or JSON/XCom conversion inferred a value such as `phone` as numeric. The validation code converts the email and phone columns to pandas' nullable string dtype before applying regular expressions. Keep that conversion when adding new string-based quality checks; do not call `.str` directly on an inferred column.
+
+### ELT DuckDB lock error
+
+If an ELT raw-load task reports:
+
+```text
+Could not set lock on file ... warehouse_rudin_elt.duckdb
+```
+
+More than one task is trying to write the same DuckDB file. The raw-load tasks in [nammamart_elt_rudin.py](../dags/nammamart_elt_rudin.py) are intentionally chained one after another. If a new raw task is added, place it in that chain instead of making it an independent parallel branch. The ETL and ELT DAGs also use separate warehouse files.
+
+### Airflow 3 audit-task error
+
+If `audit_run` reports either `DagRun object has no attribute get_task_instances` or `Direct database access via the ORM is not allowed in Airflow 3.0`, do not query Airflow's metadata database from a task. The audit implementation uses an XCom success marker from its direct upstream reporting task, which is compatible with Airflow 3.
+
+### Stale runs blocking a new run
+
+Each DAG has `max_active_runs=1`. If an old run remains `running` after a crash or restart, a new run can remain queued. First inspect the old run in the UI. For a local development environment, restart Astro and clear only the stale running task instances:
+
+```powershell
+astro dev restart
+astro dev run tasks clear nammamart_etl_rudin --only-running --yes
+astro dev run tasks clear nammamart_elt_rudin --only-running --yes
+```
+
+Use these commands only for stale local runs. Clearing task instances changes their state and may cause them to be retried. Afterward, trigger one fresh run per DAG and verify that the final state is `success`.
+
+### Import errors versus runtime errors
+
+Use the following distinction when diagnosing a problem:
+
+```powershell
+astro dev run dags list-import-errors
+```
+
+`No data found` means no DAG import errors were found. It does not prove that a task will succeed at runtime. Runtime failures must be diagnosed from the failed task's log and the task-state command above. Warnings about Graphviz, deprecated Airflow imports, or the Astro managed secrets backend are not DAG import failures.
+
+## 12. Stop Astro/Airflow
 
 When finished, stop the local deployment:
 
