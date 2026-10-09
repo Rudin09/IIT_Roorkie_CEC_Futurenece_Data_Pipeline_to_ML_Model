@@ -54,22 +54,33 @@ Check that Airflow can import both DAG files:
 astro dev run dags list-import-errors
 ```
 
-List the DAGs and confirm their schedule:
+List the DAGs and confirm that both NammaMart DAGs were discovered:
 
 ```powershell
 astro dev run dags list | Select-String "nammamart"
 ```
 
-Both DAGs should show:
+With the current Airflow 3 CLI, the output uses these columns:
 
 ```text
-nammamart_etl_rudin
-nammamart_elt_rudin
-Schedule: 0 9 * * 1-6
-Timezone: Asia/Kolkata
+dag_id | fileloc | owners | is_paused | bundle_name | bundle_version
 ```
 
-The cron expression means Monday through Saturday at 9:00 AM IST. Airflow displays this as 03:30 UTC.
+The expected NammaMart rows are similar to:
+
+```text
+nammamart_elt_rudin | /usr/local/airflow/dags/nammamart_elt_rudin.py | fde-cohort | True | dags-folder | None
+nammamart_etl_rudin | /usr/local/airflow/dags/nammamart_etl_rudin.py | fde-cohort | True | dags-folder | None
+```
+
+Here, `None` is the local `bundle_version`; it is not the DAG schedule and is normal for DAGs loaded from `dags-folder`. `True` means that the DAG is currently paused. The `dags list` command does not display the schedule in this Airflow version. Check each schedule explicitly with:
+
+```powershell
+astro dev run dags details nammamart_etl_rudin
+astro dev run dags details nammamart_elt_rudin
+```
+
+The details output should show `0 9 * * 1-6` with the `Asia/Kolkata` timezone. This means Monday through Saturday at 9:00 AM IST; Airflow displays the corresponding UTC time as 03:30 UTC.
 
 ## 4. Enable the DAGs in the Airflow UI
 
