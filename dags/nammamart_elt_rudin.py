@@ -19,6 +19,7 @@ import pandas as pd
 import pendulum
 from airflow.decorators import dag, task
 from airflow.utils.context import get_current_context
+from airflow.utils.trigger_rule import TriggerRule
 
 
 DATA_DIR = "/usr/local/airflow/include/data/nammamart"
@@ -139,6 +140,46 @@ def nammamart_elt_rudin():
             print(f"[Mart] {table_name}: {row_count} rows")
         con.close()
 
+    # -------------------- AUDIT: always record the run outcome ---------------
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def audit_run():
+        """Record run timing and row counts even when an upstream task fails."""
+        context = get_current_context()
+        task_instance = context["ti"]
+        dag_run = context["dag_run"]
+        rows_extracted = sum(task_instance.xcom_pull(task_ids=task_id) or 0 for task_id in [
+            "load_raw_orders", "load_raw_payments", "load_raw_customers", "load_raw_products", "load_raw_stores", "load_raw_increment"
+        ])
+        con = duckdb.connect(WAREHOUSE_DB)
+        try:
+            rows_loaded = con.execute("SELECT COUNT(*) FROM stg_orders").fetchone()[0]
+            rows_quarantined = con.execute("""
+                SELECT COALESCE((SELECT COUNT(*) FROM stg_orders WHERE dq_status = 'FAIL'), 0)
+                     + COALESCE((SELECT COUNT(*) FROM stg_payments WHERE dq_status = 'FAIL'), 0)
+                     + COALESCE((SELECT COUNT(*) FROM stg_customers WHERE dq_status = 'FAIL'), 0)
+                     + COALESCE((SELECT COUNT(*) FROM stg_products WHERE dq_status = 'FAIL'), 0)
+                     + COALESCE((SELECT COUNT(*) FROM stg_stores WHERE dq_status = 'FAIL'), 0)
+            """).fetchone()[0]
+        except duckdb.CatalogException:
+            rows_loaded = 0
+            rows_quarantined = 0
+        con.execute("""CREATE TABLE IF NOT EXISTS pipeline_runs (
+            run_id VARCHAR, dag_id VARCHAR, start_time TIMESTAMP, end_time TIMESTAMP,
+            rows_extracted BIGINT, rows_loaded BIGINT, rows_quarantined BIGINT, status VARCHAR
+        )""")
+        upstream_failed = any(
+            item.task_id != context["task"].task_id
+            and item.state not in {"success", "skipped"}
+            for item in dag_run.get_task_instances()
+        )
+        status = "failed" if upstream_failed else "success"
+        con.execute("INSERT INTO pipeline_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+            dag_run.run_id, context["dag"].dag_id, dag_run.start_date,
+            pendulum.now("UTC"), rows_extracted, rows_loaded, rows_quarantined, status,
+        ])
+        con.close()
+        print(f"[Audit] run_id={dag_run.run_id} status={status} extracted={rows_extracted} loaded={rows_loaded} rejected={rows_quarantined}")
+
     raw_orders = load_raw_orders()
     raw_payments = load_raw_payments()
     raw_customers = load_raw_customers()
@@ -152,7 +193,9 @@ def nammamart_elt_rudin():
     staging = build_staging(raw_orders, raw_increment, raw_payments, raw_customers, raw_products, raw_stores)
     upserted = apply_order_upsert(staging)
     dq = record_dq_results(upserted)
-    build_marts(dq)
+    marts = build_marts(dq)
+    audit_task = audit_run()
+    marts >> audit_task
 
 
 nammamart_elt_rudin()

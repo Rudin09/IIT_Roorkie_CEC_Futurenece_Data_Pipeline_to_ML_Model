@@ -21,6 +21,7 @@ import pandas as pd
 import pendulum
 from airflow.decorators import dag, task
 from airflow.utils.context import get_current_context
+from airflow.utils.trigger_rule import TriggerRule
 
 
 DATA_DIR = "/usr/local/airflow/include/data/nammamart"
@@ -72,6 +73,22 @@ def _mask_phone(value: str) -> str:
     return f"{'*' * max(len(value) - 2, 0)}{value[-2:]}" if value else "***"
 
 
+def _dq_row(check_name, dimension, severity, rows_checked, rows_failed, run_id, dag_id):
+    """Create one scorecard record for a Python data-quality check."""
+    status = "PASS" if rows_failed == 0 else "WARN" if severity == "Warning" else "FAIL"
+    return {
+        "run_id": run_id,
+        "dag_id": dag_id,
+        "check_name": check_name,
+        "dimension": dimension,
+        "severity": severity,
+        "rows_checked": int(rows_checked),
+        "rows_failed": int(rows_failed),
+        "status": status,
+        "checked_at": pendulum.now("UTC").to_datetime_string(),
+    }
+
+
 @dag(
     dag_id="nammamart_etl_rudin",
     description="NammaMart Python ETL pipeline; supports scheduled and manual runs.",
@@ -120,6 +137,9 @@ def nammamart_etl_rudin():
     @task
     def validate(orders_json, payments_json, customers_json, products_json, stores_json):
         """Split each source into passed/failed rows and retain failure reasons."""
+        context = get_current_context()
+        run_id = context["run_id"]
+        dag_id = context["dag"].dag_id
         orders = _read_json(orders_json)
         payments = _read_json(payments_json)
         customers = _read_json(customers_json)
@@ -216,6 +236,56 @@ def nammamart_etl_rudin():
         for index, row in stores.iterrows():
             if _blank(row.zone):
                 _add_failure(failures["stores"], index, "zone is blank")
+
+        # Persist a Python-generated quality scorecard for this validation run.
+        # Critical checks correspond to quarantine rules; warnings are logged
+        # while their rows remain eligible for the reporting tables.
+        def failed_count(frame, *masks):
+            combined = pd.Series(False, index=frame.index)
+            for mask in masks:
+                combined = combined | pd.Series(mask, index=frame.index).fillna(False)
+            return int(combined.sum())
+
+        order_status = orders["order_status"].str.strip().str.upper()
+        order_modes = orders["payment_mode"].str.strip()
+        payment_modes = payments["payment_mode"].str.strip()
+        order_quantity = pd.to_numeric(orders["quantity"], errors="coerce")
+        order_discount = pd.to_numeric(orders["discount_pct"], errors="coerce")
+        order_amount = pd.to_numeric(orders["order_amount"], errors="coerce")
+        order_unit_price = pd.to_numeric(orders["unit_price"], errors="coerce")
+        order_delivery = pd.to_numeric(orders["delivery_minutes"], errors="coerce")
+        expected_amount = (order_quantity * order_unit_price * (1 - order_discount / 100)).round(2)
+        order_ts = pd.to_datetime(orders["order_ts"], errors="coerce")
+        signup_date = pd.to_datetime(customers["signup_date"], errors="coerce")
+        payment_paid = pd.to_numeric(payments["amount_paid"], errors="coerce")
+        payment_expected = payments["order_id"].map(order_amounts).pipe(pd.to_numeric, errors="coerce")
+        payment_success = payments["payment_status"].str.strip().str.upper().eq("SUCCESS")
+        payment_amount_mismatch = payment_success & payment_paid.notna() & payment_expected.notna() & ((payment_paid - payment_expected).abs() > 0.01)
+        dq_records = [
+            _dq_row("required_fields", "Completeness", "Critical", len(orders) + len(payments) + len(customers) + len(products) + len(stores),
+                    failed_count(orders, orders[["order_id", "order_ts", "customer_id", "store_id", "product_id"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(payments, payments[["payment_id", "order_id", "payment_ts", "amount_paid"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(customers, customers[["customer_id", "signup_date"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(products, products[["product_id", "category"]].apply(lambda column: column.map(_blank)).any(axis=1)) + failed_count(stores, stores[["store_id", "zone"]].apply(lambda column: column.map(_blank)).any(axis=1)), run_id, dag_id),
+            _dq_row("primary_keys_unique", "Uniqueness", "Critical", len(orders) + len(payments) + len(customers) + len(products) + len(stores),
+                    int(orders.order_id.duplicated(keep=False).sum() + payments.payment_id.duplicated(keep=False).sum() + customers.customer_id.duplicated(keep=False).sum() + products.product_id.duplicated(keep=False).sum() + stores.store_id.duplicated(keep=False).sum()), run_id, dag_id),
+            _dq_row("allowed_values_and_formats", "Validity", "Critical", len(orders) + len(payments),
+                    failed_count(orders, ~order_status.isin(ALLOWED_STATUS), ~order_modes.isin(ALLOWED_PAYMENT_MODES), order_ts.isna()) + failed_count(payments, ~payment_modes.isin(ALLOWED_PAYMENT_MODES), pd.to_datetime(payments.payment_ts, errors="coerce").isna()), run_id, dag_id),
+            _dq_row("pii_format", "Validity", "Warning", len(customers),
+                    failed_count(customers, ~customers.email.str.match(r"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"), ~customers.phone.str.match(r"^\\d{10}$")), run_id, dag_id),
+            _dq_row("numeric_business_rules", "Accuracy", "Critical", len(orders) + len(products),
+                    failed_count(orders, order_quantity.isna() | (order_quantity <= 0), order_discount.isna() | ~order_discount.between(0, 100), (order_amount - expected_amount).abs() > 0.01, order_delivery.notna() & (order_delivery >= 120)) + failed_count(products, pd.to_numeric(products.mrp, errors="coerce").isna() | (pd.to_numeric(products.mrp, errors="coerce") <= 0), pd.to_numeric(products.cost_price, errors="coerce") > pd.to_numeric(products.mrp, errors="coerce")), run_id, dag_id),
+            _dq_row("foreign_keys_and_payment_match", "Consistency", "Critical", len(orders) + len(payments),
+                    failed_count(orders, ~orders.customer_id.isin(customer_ids), ~orders.product_id.isin(product_ids), ~orders.store_id.isin(store_ids)) + failed_count(payments, ~payments.order_id.isin(order_ids), payment_amount_mismatch), run_id, dag_id),
+            _dq_row("delivery_normal_range", "Accuracy", "Warning", len(orders), failed_count(orders, order_delivery.notna() & (order_delivery > 35) & (order_delivery < 120)), run_id, dag_id),
+            _dq_row("future_dates", "Timeliness", "Critical", len(orders) + len(customers), failed_count(orders, order_ts > pd.Timestamp("2026-10-09 23:59:59")) + failed_count(customers, signup_date > pd.Timestamp("2026-10-09")), run_id, dag_id),
+        ]
+        con = duckdb.connect(WAREHOUSE_DB)
+        con.execute("""CREATE TABLE IF NOT EXISTS dq_results (
+            run_id VARCHAR, dag_id VARCHAR, check_name VARCHAR, dimension VARCHAR,
+            severity VARCHAR, rows_checked BIGINT, rows_failed BIGINT,
+            status VARCHAR, checked_at TIMESTAMP
+        )""")
+        con.register("etl_dq_results_df", pd.DataFrame(dq_records))
+        con.execute("INSERT INTO dq_results SELECT * FROM etl_dq_results_df")
+        con.close()
 
         # Return a compact XCom payload containing both clean and failed rows.
         result = {}
@@ -352,6 +422,42 @@ def nammamart_etl_rudin():
         print(con.execute("SELECT * FROM etl_category_margin").fetchdf().to_string(index=False))
         con.close()
 
+    # -------------------- AUDIT: always record the run outcome ---------------
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def audit_run():
+        """Record run timing and row counts even when an upstream task fails."""
+        context = get_current_context()
+        task_instance = context["ti"]
+        dag_run = context["dag_run"]
+
+        rows_extracted = 0
+        for task_id in ["extract_orders", "extract_payments", "extract_customers", "extract_products", "extract_stores"]:
+            payload = task_instance.xcom_pull(task_ids=task_id)
+            if payload:
+                rows_extracted += len(json.loads(payload))
+        rows_quarantined = task_instance.xcom_pull(task_ids="quarantine") or 0
+        con = duckdb.connect(WAREHOUSE_DB)
+        try:
+            rows_loaded = con.execute("SELECT COUNT(*) FROM etl_fact_orders").fetchone()[0]
+        except duckdb.CatalogException:
+            rows_loaded = 0
+        con.execute("""CREATE TABLE IF NOT EXISTS pipeline_runs (
+            run_id VARCHAR, dag_id VARCHAR, start_time TIMESTAMP, end_time TIMESTAMP,
+            rows_extracted BIGINT, rows_loaded BIGINT, rows_quarantined BIGINT, status VARCHAR
+        )""")
+        upstream_failed = any(
+            item.task_id != context["task"].task_id
+            and item.state not in {"success", "skipped"}
+            for item in dag_run.get_task_instances()
+        )
+        status = "failed" if upstream_failed else "success"
+        con.execute("INSERT INTO pipeline_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+            dag_run.run_id, context["dag"].dag_id, dag_run.start_date,
+            pendulum.now("UTC"), rows_extracted, rows_loaded, rows_quarantined, status,
+        ])
+        con.close()
+        print(f"[Audit] run_id={dag_run.run_id} status={status} extracted={rows_extracted} loaded={rows_loaded} quarantined={rows_quarantined}")
+
     orders = extract_orders()
     payments = extract_payments()
     customers = extract_customers()
@@ -363,6 +469,7 @@ def nammamart_etl_rudin():
     loaded = load_star_schema(transformed)
     reconciled = reconcile_payments(validated)
     report_task = report()
+    audit_task = audit_run()
 
     # Keep the quarantine task in the critical path while allowing reconciliation
     # to run independently from the star-schema load after validation completes.
@@ -370,6 +477,7 @@ def nammamart_etl_rudin():
     quarantine_task >> transformed
     transformed >> loaded >> report_task
     reconciled >> report_task
+    report_task >> audit_task
 
 
 nammamart_etl_rudin()

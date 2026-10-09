@@ -23,4 +23,12 @@ FROM (
     SELECT 'stg_stores_quality', 'Completeness', 'Critical', COUNT(*), COUNT(*) FILTER (WHERE dq_status = 'FAIL') FROM stg_stores
     UNION ALL
     SELECT 'raw_orders_duplicate_keys', 'Uniqueness', 'Critical', COUNT(*), COUNT(*) - COUNT(DISTINCT order_id) FROM raw_orders
+    UNION ALL
+    SELECT 'orders_future_dates', 'Timeliness', 'Critical', COUNT(*), COUNT(*) FILTER (WHERE TRY_CAST(order_ts AS TIMESTAMP) > TIMESTAMP '2026-10-09 23:59:59') FROM raw_orders
+    UNION ALL
+    SELECT 'customers_future_dates', 'Timeliness', 'Critical', COUNT(*), COUNT(*) FILTER (WHERE TRY_CAST(signup_date AS DATE) > DATE '2026-10-09') FROM raw_customers
+    UNION ALL
+    SELECT 'customer_pii_format', 'Validity', 'Warning', COUNT(*), COUNT(*) FILTER (WHERE NOT regexp_matches(TRIM(email), '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$') OR NOT regexp_matches(TRIM(phone), '^[0-9]{10}$')) FROM raw_customers
+    UNION ALL
+    SELECT 'delivery_normal_range', 'Accuracy', 'Warning', COUNT(*), COUNT(*) FILTER (WHERE TRY_CAST(delivery_minutes AS INTEGER) > 35 AND TRY_CAST(delivery_minutes AS INTEGER) < 120) FROM raw_orders
 ) checks;
