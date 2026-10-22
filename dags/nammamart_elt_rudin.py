@@ -46,11 +46,29 @@ default_args = {
 }
 
 
-def _execute_sql(con, filename: str, run_id: str = "", dag_id: str = "") -> None:
+def _execute_sql(con, filename: str, run_id: str = "", dag_id: str = "", as_of_date: str = "") -> None:
     """Read a version-controlled SQL transformation and execute it in DuckDB."""
     with open(os.path.join(SQL_DIR, filename), encoding="utf-8") as sql_file:
-        statement = sql_file.read().replace("{{ run_id }}", run_id).replace("{{ dag_id }}", dag_id)
+        statement = (
+            sql_file.read()
+            .replace("{{ run_id }}", run_id)
+            .replace("{{ dag_id }}", dag_id)
+            .replace("{{ as_of_date }}", as_of_date)
+        )
     con.execute(statement)
+
+
+def _as_of_date() -> str:
+    """Return the reference date used by the freshness checks.
+
+    Defaults to the current run date in Asia/Kolkata and can be pinned with
+    the NAMMAMART_AS_OF_DATE environment variable so a historical run can be
+    reproduced exactly.
+    """
+    configured = os.environ.get("NAMMAMART_AS_OF_DATE")
+    if configured:
+        return configured
+    return pendulum.now("Asia/Kolkata").to_date_string()
 
 
 def _assert_required_columns(frame: pd.DataFrame, filename: str) -> None:
@@ -121,7 +139,7 @@ def nammamart_elt_rudin():
         """Run all staging casts, standardization, deduplication, and DQ logic."""
         context = get_current_context()
         con = duckdb.connect(WAREHOUSE_DB)
-        _execute_sql(con, "nammamart_elt_staging.sql", context["run_id"], context["dag"].dag_id)
+        _execute_sql(con, "nammamart_elt_staging.sql", context["run_id"], context["dag"].dag_id, _as_of_date())
         con.close()
         print(f"[Staging] SQL transformations complete for {len(raw_loads)} raw loads")
         return True
@@ -147,7 +165,7 @@ def nammamart_elt_rudin():
             FROM increment_ids i
             LEFT JOIN base_ids b USING (order_id)
         """).fetchone()
-        _execute_sql(con, "nammamart_elt_orders_upsert.sql", context["run_id"], context["dag"].dag_id)
+        _execute_sql(con, "nammamart_elt_orders_upsert.sql", context["run_id"], context["dag"].dag_id, _as_of_date())
         con.execute("""
             CREATE TABLE IF NOT EXISTS elt_incremental_audit (
                 run_id VARCHAR, source_file VARCHAR, inserted_count BIGINT,
@@ -168,7 +186,7 @@ def nammamart_elt_rudin():
     def record_dq_results(staging_complete):
         context = get_current_context()
         con = duckdb.connect(WAREHOUSE_DB)
-        _execute_sql(con, "nammamart_elt_dq_results.sql", context["run_id"], context["dag"].dag_id)
+        _execute_sql(con, "nammamart_elt_dq_results.sql", context["run_id"], context["dag"].dag_id, _as_of_date())
         print(con.execute("SELECT * FROM dq_results WHERE run_id = ?", [context["run_id"]]).fetchdf().to_string(index=False))
         con.close()
         return staging_complete
@@ -184,7 +202,7 @@ def nammamart_elt_rudin():
         """
         context = get_current_context()
         con = duckdb.connect(WAREHOUSE_DB)
-        _execute_sql(con, "nammamart_elt_marts.sql", context["run_id"], context["dag"].dag_id)
+        _execute_sql(con, "nammamart_elt_marts.sql", context["run_id"], context["dag"].dag_id, _as_of_date())
         for table_name in ["mart_daily_store_kpis", "mart_category_margin", "mart_delivery_sla", "mart_payment_reconciliation", "mart_top_customers"]:
             row_count = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
             print(f"[Mart] {table_name}: {row_count} rows")

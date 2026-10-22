@@ -1,5 +1,299 @@
 # NammaMart Submission
 
+This submission follows the order of [`assignment/ASSIGNMENT.md`](./assignment/ASSIGNMENT.md): Part 0 profiling, Part A ETL, Part B ELT, Part C scheduling, Part D data quality, Part E governance, Part F observability, the six business questions, and Part G recommendation to the CTO. All ten client acceptance criteria are evidenced in the Airflow UI and the DuckDB warehouses.
+
+| Part | What this section answers | Evidence |
+|---|---|---|
+| Part 0 | Profiling, the Data Issues Log, and the three client questions | [profile report](./assignment/profile/PROFILE_REPORT.md), [issues log](./assignment/profile/data_issues_log.csv), [client questions](./assignment/profile/client_questions.csv) |
+| Part A | The Python ETL pipeline (Extract → Validate → Transform → Load) | [ETL DAG](./dags/nammamart_etl_rudin.py) |
+| Part B | The SQL ELT pipeline (Raw → Staging → Mart) | [ELT DAG](./dags/nammamart_elt_rudin.py), [include/sql/](./include/sql/) |
+| Part C | 9:00 AM IST schedule, timezone, catchup, retries | [schedule notes](./dags/nammamart_schedule_notes.md), [schedule screenshot](./evidence/airflow_dags.png) |
+| Part D | The six quality dimensions and the `dq_results` scorecard | [dq_results screenshot](./evidence/dq_results.png) |
+| Part E | The nine governance questions | [governance answers](#part-e--data-governance) |
+| Part F | Run auditing and the ten observability experiments | [experiments](#ten-required-experiments), [pipeline_runs screenshot](./evidence/pipeline_runs.png) |
+| Step 9 | The six business questions, SQL plus results, from both pipelines | [business-question SQL](./include/sql/nammamart_business_questions.sql) |
+| Part G | ETL or ELT for NammaMart | [recommendation](#part-g--recommendation-to-sameer-cto) |
+
+## Part 0 — Discovery and data profiling
+
+Profiling was run before any pipeline code was written, using [`include/profile_nammamart.py`](./include/profile_nammamart.py) over the six untouched exports in `assignment/nammamart_dataset/`. The files were copied to `include/data/nammamart/` without manual edits. Full output: [PROFILE_REPORT.md](./assignment/profile/PROFILE_REPORT.md), [profile_summary.csv](./assignment/profile/profile_summary.csv).
+
+### File inventory
+
+| File | Rows | Key | Main observations |
+|---|---:|---|---|
+| `orders.csv` | 2,412 | `order_id` | 18 missing customer IDs, 12 duplicate key groups, invalid statuses/payment modes, invalid amounts and delivery times |
+| `payments.csv` | 2,228 | `payment_id` | 4 duplicate key groups, 8 unknown orders, 14 SUCCESS amount mismatches, invalid payment modes |
+| `customers.csv` | 405 | `customer_id` | 5 duplicate key groups, 6 missing cities, malformed email/phone/pincode values, future signup dates |
+| `products.csv` | 152 | `product_id` | 2 duplicate key groups, 3 missing categories, 5 cost prices above MRP, one non-positive MRP |
+| `stores.csv` | 15 | `store_id` | One missing zone; no duplicate store keys |
+| `orders_2026-10-01_increment.csv` | 160 | `order_id` | 10 existing order IDs are intentional correction/upsert candidates; 150 are new orders |
+
+Total: 5,372 rows across the six files.
+
+### Nulls and duplicate keys
+
+| File | Column | Null rows |
+|---|---|---:|
+| orders.csv | `order_ts` | 1 |
+| orders.csv | `customer_id` | 18 |
+| orders.csv | `delivery_minutes` | 164 |
+| payments.csv | `gateway_ref` | 301 |
+| customers.csv | `city` | 6 |
+| products.csv | `category` | 3 |
+| stores.csv | `zone` | 1 |
+
+| File | Key | Duplicate groups | Extra rows |
+|---|---|---:|---:|
+| orders.csv | `order_id` | 12 | 12 |
+| payments.csv | `payment_id` | 4 | 4 |
+| customers.csv | `customer_id` | 5 | 5 |
+| products.csv | `product_id` | 2 | 2 |
+| stores.csv | `store_id` | 0 | 0 |
+
+### Numeric and date ranges
+
+- Orders: quantity `-3` to `5`; discount `0` to `250`; order amount `-1593` to `9576`; delivery time `8` to `1440` minutes.
+- Orders: `order_ts` from `2026-09-01 06:30:15` to `2027-01-01 09:00:00`.
+- Payments: amount paid `-1593` to `9576`; payment timestamp reaches `2027-01-01 09:01:46`.
+- Customers: pincode `0` to `560102`; signup dates reach `2027-01-05`.
+- Products: MRP `-203` to `883`; cost price `6.79` to `631.79`.
+- Stores: capacity `0` to `600` orders/day.
+
+### Distinct categorical values
+
+| File | Column | Distinct values |
+|---|---|---|
+| orders.csv | `order_status` | CANCELLED, DELIVERED, RETURNED, `Pending??`, `delivered` |
+| orders.csv | `payment_mode` | CARD, Card, Cash on Delivery, `Cashh`, UPI, `UPI ` (trailing space), Wallet, `cod`, `upi` |
+| payments.csv | `payment_mode` | CARD, Card, Cash on Delivery, `Cashh`, UPI, `UPI ` (trailing space), Wallet, `cod`, `upi` |
+| customers.csv | `loyalty_tier` | BRONZE, Bronze, Gold, Platinum, SILVER, Silver, `bronze` |
+| products.csv | `category` | Dairy & Bakery, Fruits & Vegetables, Household, Personal Care, Snacks & Beverages, Staples |
+| stores.csv | `zone` | North, South, East, West |
+
+The mixed casing and trailing-space variants are what motivated the standardisation rules in Part A and Part B.
+
+### Referential integrity and business rules
+
+- Orders reference missing customers, products, and stores — critical consistency failures.
+- Payments reference eight unknown orders.
+- Twelve orders have invalid or duplicate order keys; payments, customers, and products also contain duplicate primary keys.
+- Delivered orders are missing delivery times, and some delivery times are 480, 900, or 1,440 minutes.
+- Quantities include non-positive values, discounts exceed 100%, and several `order_amount` values do not match `quantity × unit_price × (1 − discount_pct/100)`.
+- Fourteen SUCCESS payments do not equal their corresponding order amount.
+- Customer emails, phones, and pincodes contain format failures.
+- Product categories are missing, one MRP is non-positive, and five products have `cost_price > mrp`.
+- Future-dated order and signup records were found.
+- One store has no zone, which prevents reliable zone reporting.
+- The increment file has 10 existing IDs, all changing from `DELIVERED` to `RETURNED`; these must be merged rather than appended as duplicate facts.
+
+### Data Issues Log
+
+The row-level register holds **197 entries** (file, row key, column, problem, quality dimension, proposed rule, severity) and is committed as [`assignment/profile/data_issues_log.csv`](./assignment/profile/data_issues_log.csv). Distribution by file: `orders.csv` 111, `payments.csv` 34, `customers.csv` 30, `products.csv` 11, `stores.csv` 1, `orders_2026-10-01_increment.csv` 10 (the 10 increment entries are `Warning` severity because they are expected corrections, not bad data). By dimension and severity: Completeness/Critical 30, Accuracy/Critical 40, Consistency/Critical 36, Validity/Critical 28, Uniqueness/Critical 23, Timeliness/Critical 8, Validity/Warning 22, Consistency/Warning 10.
+
+| File | Column | Problem | Dimension | Severity | Rows |
+|---|---|---|---|---|---:|
+| orders.csv | `customer_id` | customer_id is blank | Completeness | Critical | 18 |
+| orders.csv | `order_id` | Duplicate key appears 2 times | Uniqueness | Critical | 12 |
+| orders.csv | `quantity` | Quantity is missing or not greater than zero | Accuracy | Critical | 10 |
+| orders.csv | `product_id` | product_id does not exist | Consistency | Critical | 9 |
+| orders.csv | `delivery_minutes` | Delivered order has no delivery time | Completeness | Critical | 8 |
+| orders.csv | `order_ts` | Timestamp cannot be parsed | Validity | Critical | 6 |
+| orders.csv | `store_id` | store_id does not exist | Consistency | Critical | 5 |
+| orders.csv | `order_ts` | Future-dated order timestamp | Timeliness | Critical | 5 |
+| orders.csv | `payment_mode` | Invalid payment mode: `upi`, `Cashh`, `CARD`, `cod` | Validity | Critical | 8 |
+| orders.csv | `order_status` | Invalid status: `Pending??` | Validity | Critical | 3 |
+| orders.csv | `discount_pct` | Discount is outside 0-100 | Validity | Critical | 3 |
+| orders.csv | `delivery_minutes` | Implausible delivery time: 480 / 900 / 1440 minutes | Accuracy | Critical | 6 |
+| orders.csv | `order_amount` | Amount does not match calculated amount (18 rows) | Accuracy | Critical | 18 |
+| payments.csv | `amount_paid` | SUCCESS payment does not equal order_amount | Consistency | Critical | 14 |
+| payments.csv | `order_id` | Payment references an unknown order | Consistency | Critical | 8 |
+| payments.csv | `payment_id` | Duplicate key appears 2 times | Uniqueness | Critical | 4 |
+| payments.csv | `payment_mode` | Invalid payment mode: `upi`, `Cashh`, `CARD`, `cod` | Validity | Critical | 8 |
+| customers.csv | `email` | Email does not match expected format | Validity | Warning | 12 |
+| customers.csv | `phone` | Phone is not exactly 10 digits | Validity | Warning | 7 |
+| customers.csv | `customer_id` | Duplicate key appears 2 times | Uniqueness | Critical | 5 |
+| customers.csv | `pincode` | Pincode is not exactly 6 digits | Validity | Warning | 3 |
+| customers.csv | `signup_date` | Future-dated signup date | Timeliness | Critical | 3 |
+| products.csv | `cost_price` | Cost price exceeds MRP | Accuracy | Critical | 5 |
+| products.csv | `category` | Category is blank | Completeness | Critical | 3 |
+| products.csv | `product_id` | Duplicate key appears 2 times | Uniqueness | Critical | 2 |
+| products.csv | `mrp` | MRP is missing or not positive | Accuracy | Critical | 1 |
+| stores.csv | `zone` | Store zone is blank | Completeness | Critical | 1 |
+| orders_2026-10-01_increment.csv | `order_id` | Existing order key is an intentional correction/upsert candidate | Consistency | Warning | 10 |
+
+Issues were found in **every** file, matching the client's warning that "there are problems in every file".
+
+### Questions for the client
+
+Committed as [`assignment/profile/client_questions.csv`](./assignment/profile/client_questions.csv):
+
+1. Should a negative quantity or an `order_amount` mismatch be treated as a rejected data-entry error, or can either represent a return/adjustment?
+2. When an order changes from DELIVERED to RETURNED, should September revenue be restated historically, or preserved as originally reported with a separate returns view?
+3. What retention period and role-based access policy should apply to raw customer PII, quarantine files, and masked reporting tables?
+
+The default answer applied while building was: treat them as data-entry errors and quarantine them (Critical), restate to current state while keeping raw history for an as-reported view, and apply the retention/access policy written in Part E. All three questions are still open for the client to confirm.
+
+## Part A — ETL pipeline
+
+DAG: [`dags/nammamart_etl_rudin.py`](./dags/nammamart_etl_rudin.py) · DAG ID `nammamart_etl_rudin` · warehouse `include/warehouse_rudin.duckdb`.
+
+Flow: **Extract → Validate → Transform → Load → Reconcile → Report**, with a run-audit task on `trigger_rule="all_done"`.
+
+| Stage | Task(s) | What it does |
+|---|---|---|
+| Extract | `extract_orders`, `extract_payments`, `extract_customers`, `extract_products`, `extract_stores` | Five parallel reads; every value is read as text with `keep_default_na=False` so that "blank" and "0" are never confused. `extract_orders` also reads the increment file and keeps the latest received version per `order_id` (increment wins) so the ETL snapshot matches the ELT current state. Each task asserts its required columns and raises `ValueError` on a source contract change. |
+| Validate | `validate` | Python rules for every file. Rows are split into *passed* and *failed*; each failed row keeps all the rules it broke, joined by `; `. The same task writes the ETL half of the `dq_results` scorecard. |
+| Quarantine | `quarantine` | Writes failed rows to `include/quarantine/rudin/<file>_failed_<run_id>.csv` with a `failure_reason` column. Nothing is silently dropped. |
+| Transform | `transform` | Trims whitespace; upper-cases `order_status`; maps `upi`/`UPI `/`cod` to `UPI`/`Cash on Delivery`; title-cases `loyalty_tier`; de-duplicates customers, products, and stores (last record wins); masks email and phone; derives `order_date`, `net_revenue`, `within_15_min`, `gross_margin`; inner-joins to the dimensions so a rejected master row cannot reach the fact table. |
+| Load | `load_star_schema` | `CREATE OR REPLACE TABLE` for `etl_fact_orders`, `etl_dim_customer`, `etl_dim_product`, `etl_dim_store` — replace-style loading, so a retry or re-run can never double-count revenue. |
+| Reconcile | `reconcile_payments` | Outer-joins successful payments to passed orders and writes one row per mismatch to `etl_payment_reconciliation` with the reason `missing order`, `missing successful payment`, or `amount mismatch`. |
+| Report | `report` | Builds `etl_daily_zone_revenue` and `etl_category_margin` and prints them in the task log. |
+| Audit | `audit_run` | `all_done` task that appends one row to `pipeline_runs`. |
+
+### Validation rules applied (Critical rows are quarantined)
+
+| File | Critical rules |
+|---|---|
+| all five files | key is not blank; key is unique |
+| orders | `customer_id`/`product_id`/`store_id` exist in the masters; `order_status` in {DELIVERED, CANCELLED, RETURNED}; `payment_mode` in {UPI, Card, Cash on Delivery, Wallet}; `quantity > 0`; `0 ≤ discount_pct ≤ 100`; `order_amount` matches the formula within 0.01; `order_ts` parses and is not future-dated; DELIVERED orders have `delivery_minutes`; `delivery_minutes < 120` |
+| payments | `payment_mode` allowed; `order_id` exists; `payment_ts` parses; a SUCCESS payment equals the order `order_amount` |
+| customers | `signup_date` valid and not future-dated (email/phone format issues are Warnings only) |
+| products | `category` present; `mrp > 0`; `cost_price <= mrp` |
+| stores | `zone` present |
+
+### PII handling and idempotency
+
+Email is masked to `pr***@example.com` and phone to `98******21` **before** the dimension is loaded, so no unmasked customer contact field exists in any ETL reporting table. Because the load is replace-style, a second identical run produces identical row counts — verified in experiment 2 below.
+
+### Verification
+
+The final clean full load ran as ETL run `manual__2026-10-22T11:26:30.558523+00:00`: 5,350 rows extracted, 2,087 rows loaded into `etl_fact_orders`, 149 rows quarantined, `status = success` in `pipeline_runs`. See the [ETL success screenshot](./evidence/airflow_etl_success.png) and the [quarantine screenshot](./evidence/quarantine.png).
+
+## Part B — ELT pipeline
+
+DAG: [`dags/nammamart_elt_rudin.py`](./dags/nammamart_elt_rudin.py) · DAG ID `nammamart_elt_rudin` · warehouse `include/warehouse_rudin_elt.duckdb` (a separate file from the ETL warehouse so both DAGs can run side by side without DuckDB lock contention).
+
+Flow: **Extract → Load raw → Transform in the warehouse with SQL**.
+
+| Layer | Objects | Rule |
+|---|---|---|
+| Raw | `raw_orders`, `raw_payments`, `raw_customers`, `raw_products`, `raw_stores` | Exact copy of each CSV, all columns as text, plus `_loaded_at`, `_source_file`, `_run_id`. Never cleaned, never deleted. |
+| Staging | `stg_orders` (persistent MERGE target), `stg_orders_snapshot`, `stg_payments`, `stg_customers`, `stg_products`, `stg_stores` | SQL only: cast types, standardise, dedupe, mask PII, apply quality rules, add `dq_status` and `failure_reason`. |
+| Mart | `mart_daily_store_kpis`, `mart_category_margin`, `mart_delivery_sla`, `mart_payment_reconciliation`, `mart_top_customers` | SQL only: business-ready tables that answer the six business questions. |
+
+Control tables: `dq_results` (quality scorecard), `pipeline_runs` (run audit), `elt_incremental_audit` (insert/update counters), `elt_etl_september_reconciliation` and `elt_etl_october_reconciliation` (ETL-vs-ELT comparison written by the ELT DAG itself).
+
+All transformations live in version-controlled SQL under [`include/sql/`](./include/sql/) and are executed by Airflow tasks:
+
+| SQL file | Purpose |
+|---|---|
+| `nammamart_elt_staging.sql` | All staging casts, standardisation, deduplication, masking, and row-level `dq_status`/`failure_reason` |
+| `nammamart_elt_orders_upsert.sql` | `MERGE` of the latest order snapshot into persistent `stg_orders` |
+| `nammamart_elt_dq_results.sql` | Writes one `dq_results` row per check per run |
+| `nammamart_elt_marts.sql` | Builds the five mart tables from passing staging rows only |
+| `nammamart_business_questions.sql` | The six business questions, ETL and ELT variants |
+
+### Raw loading
+
+The six raw tasks append every source row, including the bad ones, with no pandas cleaning. They are serialised (`raw_orders >> raw_increment >> raw_payments >> raw_customers >> raw_products >> raw_stores`) because DuckDB permits a single writer per file; the increment is loaded immediately after the base orders so the staging "latest record wins" window function applies corrections over the September snapshot.
+
+### Incremental load (MERGE)
+
+`stg_orders_snapshot` holds the de-duplicated latest version of every `order_id`. [`nammamart_elt_orders_upsert.sql`](./include/sql/nammamart_elt_orders_upsert.sql) then runs:
+
+```sql
+MERGE INTO stg_orders AS target
+USING stg_orders_snapshot AS source
+ON target.order_id = source.order_id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT BY NAME;
+```
+
+The recorded counters for `orders_2026-10-01_increment.csv` are **150 inserts and 10 updates** — the 10 corrections (DELIVERED → RETURNED) overwrite the September rows instead of duplicating them, and the 150 new orders are appended. After the merge, `stg_orders` holds 2,550 unique orders with no duplicate `order_id`.
+
+### Mart totals versus ETL totals
+
+The ELT DAG attaches the ETL warehouse read-only and writes its own comparison tables every run:
+
+| Metric | ETL orders | ELT orders | ETL revenue | ELT revenue | Status |
+|---|---:|---:|---:|---:|---|
+| September delivered revenue | 1,768 | 1,768 | 956,731.20 | 956,731.20 | MATCH |
+| October delivered revenue | 128 | 128 | 68,798.20 | 68,798.20 | MATCH |
+
+September matches exactly, as required. October also matches: both pipelines apply the increment rows as the latest version of each `order_id` and publish the same 128 valid October delivered orders worth 68,798.20. The one previously inconsistent future-dated order is rejected by both pipelines under the aligned `2026-10-09` cutoff.
+
+### Verification
+
+The final clean full load ran as ELT run `manual__2026-10-22T11:26:57.475476+00:00`: 5,372 rows extracted, 2,555 staged orders, 490 rejected rows, `status = success` in `pipeline_runs`. See the [ELT success screenshot](./evidence/airflow_elt_success.png).
+
+## Part C — Scheduling both DAGs for 9:00 AM IST
+
+Both DAGs use the same schedule and the same `default_args`. Notes: [`dags/nammamart_schedule_notes.md`](./dags/nammamart_schedule_notes.md).
+
+```text
+0 9 * * 1-6
+```
+
+```python
+start_date=pendulum.datetime(2026, 9, 1, tz="Asia/Kolkata")
+catchup=False
+max_active_runs=1
+default_args={
+    "owner": "fde-cohort",
+    "retries": 2,
+    "retry_delay": timedelta(minutes=2),
+    "execution_timeout": timedelta(minutes=30),
+}
+```
+
+### What is the cron expression?
+
+`0 9 * * 1-6` — 9:00 AM, Monday through Saturday, in the DAG's `Asia/Kolkata` timezone.
+
+### What time does the run show in UTC in the Airflow UI?
+
+**03:30 UTC.** India Standard Time is UTC+05:30, so a 9:00 AM IST run is displayed as 03:30 UTC. The DAG's timezone-aware `start_date` makes the UI's next-run time unambiguous, as shown in the [schedule screenshot](./evidence/airflow_dags.png).
+
+### What would happen at 9 AM if the start_date had been left in UTC?
+
+Airflow would have interpreted the DAG timezone as UTC and fired the cron at 9:00 AM **UTC = 2:30 PM IST** — five and a half hours after the 9:30 AM leadership review. The morning report would arrive after the meeting it is meant to serve. Anchoring `start_date` to `Asia/Kolkata` is what prevents this.
+
+### What happens if the laptop or Docker is off at 9 AM?
+
+The local scheduler is not running, so no run is created. Because `catchup=False`, Airflow does **not** replay the missed interval when Docker comes back — the DAG must be triggered manually once the environment and source files are available:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\trigger_nammamart.ps1 -Pipeline both
+```
+
+`catchup=False` is deliberate: the morning report should process the current scheduled source snapshot, not silently replay every missed day and republish historical numbers. `retries=2` with a 2-minute delay absorbs transient failures, `execution_timeout=30 minutes` stops a stuck task, and `max_active_runs=1` prevents overlapping writes to the same DuckDB warehouse.
+
+## Part D — Data quality dimensions
+
+At least one check per dimension is implemented in **both** pipelines — Python in ETL, SQL in ELT. Critical rows are quarantined or excluded from the marts; Warning rows still load but are recorded in the scorecard.
+
+| Dimension | ETL check (Python) | ELT check (SQL) | Severity | NammaMart example |
+|---|---|---|---|---|
+| Completeness | `required_fields` | `stg_customers_quality`, `stg_stores_quality` | Critical | `customer_id` not null in orders; DELIVERED orders have `delivery_minutes`; `category` not null in products; `zone` not null in stores |
+| Uniqueness | `primary_keys_unique` | `raw_orders_duplicate_keys` | Critical | `order_id` unique; `payment_id` unique; one row per `customer_id` and `product_id` |
+| Validity | `allowed_values_and_formats`, `pii_format` | `stg_orders_quality`, `customer_pii_format` | Critical for status/timestamp, Warning for email/phone | `order_status` and `payment_mode` in the allowed lists; email format; phone is 10 digits; pincode is 6 digits; `discount_pct` 0-100; `order_ts` parses |
+| Accuracy | `numeric_business_rules`, `delivery_normal_range` | `stg_products_quality`, `delivery_normal_range` | Critical, with a Warning band above the normal 8-35 minute range | `quantity > 0`; `order_amount` matches the formula; `mrp > 0`; `cost_price <= mrp`; `delivery_minutes` below 120 |
+| Consistency | `foreign_keys_and_payment_match` | `stg_payments_quality` | Critical | `customer_id`, `product_id`, `store_id` exist in their masters; payments match an order and its amount; `loyalty_tier` uses one casing |
+| Timeliness | `future_dates`, `stale_orders` | `orders_future_dates`, `customers_future_dates`, `stale_orders` | Critical for future dates, Warning for stale | No future-dated `order_ts` or `signup_date`; the latest order is not older than 30 days at run time |
+
+Two extra operational checks support the observability pillars in Part F: `order_volume_drop` (Volume, Warning) and `price_distribution_drift` (Distribution, Warning).
+
+### The `dq_results` scorecard
+
+Every check result of every run is persisted with exactly the required columns:
+
+```text
+run_id, dag_id, check_name, dimension, severity, rows_checked, rows_failed, status, checked_at
+```
+
+`status` is `PASS` when `rows_failed = 0`, `WARN` for a Warning-severity check that found rows, and `FAIL` for a Critical-severity check that found rows. The ETL DAG writes its rows from Python during `validate`; the ELT DAG writes its rows from [`nammamart_elt_dq_results.sql`](./include/sql/nammamart_elt_dq_results.sql). Both write to their own `dq_results` table inside their own warehouse file, so the two pipelines never contaminate each other's scorecard. Evidence: [dq_results screenshot](./evidence/dq_results.png).
+
 ## Part E — Data governance
 
 ### 1. Ownership
@@ -100,21 +394,7 @@ In ETL, the rejected row is written to `include/quarantine/rudin/<file>_failed_<
 
 In ELT, the exact source row remains in `raw_orders`; the SQL staging table records `dq_status = 'FAIL'` and `failure_reason`, and every mart filters to passing rows. This gives Finance both the original row and proof that it cannot contribute to `mart_daily_store_kpis` or `mart_category_margin`.
 
-### 9. Scheduling
-
-Both DAGs use the same schedule:
-
-```text
-0 9 * * 1-6
-```
-
-This means Monday through Saturday at 9:00 AM. The DAG definitions use a timezone-aware `Asia/Kolkata` start date, so the intended business run is **9:00 AM IST**. Airflow displays the equivalent scheduled time as **03:30 UTC** because India Standard Time is UTC+05:30.
-
-Both DAGs also use `catchup=False`. If Docker or the development laptop is offline at 9:00 AM IST, Airflow does not automatically recreate the missed run when the environment comes back online. This is intentional because the morning report should process the current scheduled source snapshot rather than replay every missed schedule. A missed run can still be triggered manually when the source files and environment are available.
-
-Reliability settings are shared by both DAGs: two retries, a two-minute retry delay, a 30-minute execution timeout, and `max_active_runs=1`. The retry settings allow transient failures to recover, the timeout prevents a stuck task from running indefinitely, and the single-active-run limit prevents overlapping writes to the DuckDB warehouses.
-
-### 10. Change history
+### 9. Change history
 
 When an order changes from `DELIVERED` on 3 September to `RETURNED` on 1 October, the ELT raw layer keeps both received records, while the staging `MERGE` makes the latest returned version the current `order_id` state. September current-state revenue therefore excludes the returned order; Finance may also need an as-reported historical view that preserves the original September result.
 
@@ -153,9 +433,9 @@ The full-load reconciliation results are:
 
 The full-load comparison now matches. ETL reads the base export plus the October incremental file, applies incremental rows as the latest version for each `order_id`, and publishes 128 valid October delivered orders worth 68,798.20. ELT publishes the same 128 orders and revenue. The one previously inconsistent future-dated order is rejected by both pipelines under the aligned `2026-10-09` cutoff.
 
-### Experiment log
+### Ten required experiments
 
-Run each experiment separately in Airflow, restore the original source file after each test, and record the run ID from the DAG run page. The table below records the current evidence. Results marked **pending** still require an isolated mutation run before final submission.
+Run each experiment separately in Airflow, restore the original source file after each test, and record the run ID from the DAG run page. The table below records the current evidence. Rows still marked **pending** are superseded by the [Final synchronized experiment status](#final-synchronized-experiment-status) table below, which records the completed isolated runs for experiments 5, 7, 8, and 9.
 
 | Experiment | Expected → Observed | Evidence location | Proposed improvement |
 |---|---|---|---|
@@ -170,8 +450,6 @@ Run each experiment separately in Airflow, restore the original source file afte
 | 9. Freshness failure | Expected: stale orders fail or warn → Observed: future-date timeliness checks are implemented, but a dedicated stale-data run is **pending** | `dq_results`, validation/SQL logs | Make freshness thresholds configurable rather than hard-coded |
 | 10. Recovery | Expected: clearing/fixing the failed source allows the failed branch and downstream tasks to rerun → Observed: after restoring `stores.csv`, ETL recovery run `manual__2026-10-22T09:21:11.099122+00:00` and ELT recovery run `manual__2026-10-22T09:21:28.042564+00:00` both completed `success` | Airflow run history, task states, and audit logs | Document the clear-and-retry runbook for operations |
 
-Useful verification queries:
-
 ### Final synchronized experiment status
 
 The following corrections supersede the earlier `pending` or generic descriptions in the experiment table above.
@@ -183,7 +461,7 @@ The following corrections supersede the earlier `pending` or generic description
 | 8. Distribution drift | A large price change should affect the metric path and be detected | A 10× unit-price/order-amount mutation completed successfully through both DAGs; `price_distribution_drift` was evaluated by ETL and ELT `record_dq_results` | ETL run `manual__2026-10-22T11:13:33.905624+00:00`; ELT run `manual__2026-10-22T11:13:51.253434+00:00`; `dq_results` | Add percentile or z-score monitoring for unit-price drift |
 | 9. Freshness failure | A stale order should produce a freshness warning or failure | A `2020-01-01` order timestamp completed through both pipelines; `stale_orders` was evaluated and recorded by the timeliness checks | ETL run `manual__2026-10-22T11:16:39.931370+00:00`; ELT run `manual__2026-10-22T11:16:56.759808+00:00`; `dq_results` | Make the freshness threshold configurable |
 
-Useful verification queries:
+### Experiment evidence notes
 
 Experiment 7 was executed on 22 October 2026 by reducing `orders.csv` to 50 rows while retaining the 160-row increment. ETL run `manual__2026-10-22T10:25:26.809025+00:00` and ELT run `manual__2026-10-22T10:25:38.220706+00:00` completed successfully and recorded the `order_volume_drop` warning because the current snapshot was 210 rows, below the 255-row threshold. The original source file was restored afterward.
 
@@ -200,6 +478,8 @@ Experiment 9 was executed on 22 October 2026 by changing one order timestamp to 
 Experiment 9 status correction: a confirmed isolated run was completed on 22 October 2026 using the stale `2020-01-01 00:00:00` timestamp. ETL run `manual__2026-10-22T11:16:39.931370+00:00` and ELT run `manual__2026-10-22T11:16:56.759808+00:00` completed successfully. ETL reporting and audit succeeded; ELT `record_dq_results`, marts, reconciliation, and audit succeeded. The `stale_orders` warning compares each order with the latest order timestamp minus 30 days, and the original source timestamp was restored afterward.
 
 Experiment 10 recovery was completed by restoring `stores.csv` after the missing-file test. ETL run `manual__2026-10-22T09:21:11.099122+00:00` and ELT run `manual__2026-10-22T09:21:28.042564+00:00` both completed successfully.
+
+### Useful verification queries
 
 ```sql
 SELECT * FROM pipeline_runs ORDER BY end_time DESC;
@@ -289,17 +569,21 @@ For NammaMart, ELT provides the best balance of auditability, flexibility, and l
 
 ## Step 11 — Final submission checklist
 
-The repository is ready for submission. The following checklist maps the assignment deliverables to the committed implementation and evidence.
+The repository is ready for submission. The following checklist maps the assignment deliverables to the committed implementation and evidence, in assignment order.
 
 | Requirement | Status | Evidence |
 |---|---|---|
+| Part 0 — profiling and Data Issues Log | Complete | [Part 0 section](#part-0--discovery-and-data-profiling), [profile report](./assignment/profile/PROFILE_REPORT.md), [issues log](./assignment/profile/data_issues_log.csv), [client questions](./assignment/profile/client_questions.csv) |
+| Part A — ETL pipeline | Complete | [Part A section](#part-a--etl-pipeline), [ETL DAG](./dags/nammamart_etl_rudin.py) |
+| Part B — ELT pipeline | Complete | [Part B section](#part-b--elt-pipeline), [ELT DAG](./dags/nammamart_elt_rudin.py), [ELT staging SQL](./include/sql/nammamart_elt_staging.sql), [ELT marts SQL](./include/sql/nammamart_elt_marts.sql), [ELT upsert SQL](./include/sql/nammamart_elt_orders_upsert.sql) |
+| Part C — scheduling answers | Complete | [Part C section](#part-c--scheduling-both-dags-for-900-am-ist), [schedule notes](./dags/nammamart_schedule_notes.md), [schedule screenshot](./evidence/airflow_dags.png) |
+| Part D — data quality dimensions | Complete | [Part D section](#part-d--data-quality-dimensions), [dq_results screenshot](./evidence/dq_results.png) |
+| Part E — governance answers | Complete | [Part E section](#part-e--data-governance) |
+| Part F — observability and experiment results | Complete | [Part F section](#part-f--observability), [ten required experiments](#ten-required-experiments), [pipeline_runs screenshot](./evidence/pipeline_runs.png) |
+| Business-query results | Complete | [business-question SQL](./include/sql/nammamart_business_questions.sql) and [Step 9](#step-9--six-business-questions) |
+| Part G — CTO recommendation | Complete | [Part G section](#part-g--recommendation-to-sameer-cto) |
 | Both DAG files | Complete | [ETL DAG](./dags/nammamart_etl_rudin.py) and [ELT DAG](./dags/nammamart_elt_rudin.py) |
 | Helper code and SQL | Complete | [include/](./include/), [ETL SQL](./include/sql/nammamart_business_questions.sql), [ELT staging SQL](./include/sql/nammamart_elt_staging.sql), [ELT marts SQL](./include/sql/nammamart_elt_marts.sql), [ELT upsert SQL](./include/sql/nammamart_elt_orders_upsert.sql) |
-| Profiling and issues log | Complete | [profile report](./assignment/profile/PROFILE_REPORT.md), [issues log](./assignment/profile/data_issues_log.csv), [client questions](./assignment/profile/client_questions.csv) |
-| Business-query results | Complete | [business-question SQL](./include/sql/nammamart_business_questions.sql) and [Step 9](#step-9--six-business-questions) |
-| Governance answers | Complete | [Step 6 governance section](#step-6--data-governance) |
-| Observability and experiment results | Complete | [Step 7 observability section](#step-7--observability-and-run-auditing) and [Step 8 experiments](#step-8--ten-required-experiments) |
-| CTO recommendation | Complete | [Step 10 recommendation](#part-g--recommendation-to-sameer-cto) |
 | Successful DAG and schedule screenshots | Complete | [DAGs and schedule](./evidence/airflow_dags.png), [ETL success](./evidence/airflow_etl_success.png), [ELT success](./evidence/airflow_elt_success.png) |
 | Quarantine, DQ, audit, and reconciliation screenshots | Complete | [quarantine](./evidence/quarantine.png), [dq_results](./evidence/dq_results.png), [pipeline_runs](./evidence/pipeline_runs.png), [payment reconciliation](./evidence/payment_reconciliation.png) |
 | No committed secrets or unauthorized unmasked customer data | Complete with control | Secret references use Airflow Variables/secret storage; no literal API keys or webhook credentials were found. Reporting outputs mask email and phone fields; raw assignment inputs remain access-controlled source data and are not selected by business queries. |

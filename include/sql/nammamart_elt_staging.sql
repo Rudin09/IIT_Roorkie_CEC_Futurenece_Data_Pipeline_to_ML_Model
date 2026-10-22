@@ -1,11 +1,21 @@
 -- NammaMart ELT staging layer.
 -- Raw data stays untouched; all casts, standardization, masking, deduplication,
 -- and row-level quality status decisions happen in this SQL transformation.
+--
+-- Every staging table is built from the *current* snapshot of each source
+-- file: the rows written by the most recent load of that file. The raw layer
+-- stays append-only, so an older run (or an experiment mutation) can never
+-- change the current state that the marts publish.
 
 CREATE OR REPLACE TABLE stg_customers AS
-WITH source_rows AS (
+WITH latest_load AS (
+    SELECT MAX(_loaded_at) AS latest_loaded_at FROM raw_customers
+), current_rows AS (
+    SELECT r.* FROM raw_customers r
+    JOIN latest_load l ON r._loaded_at = l.latest_loaded_at
+), source_rows AS (
     SELECT *, COUNT(DISTINCT md5(concat_ws('|', customer_id, full_name, email, phone, city, area, pincode, signup_date, loyalty_tier, is_active))) OVER (PARTITION BY customer_id) AS source_duplicate_versions
-    FROM raw_customers
+    FROM current_rows
 ), ranked AS (
     SELECT *,
            ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
@@ -14,7 +24,7 @@ WITH source_rows AS (
     SELECT
         NULLIF(TRIM(customer_id), '') AS customer_id,
         NULLIF(TRIM(full_name), '') AS full_name,
-        CASE WHEN regexp_matches(TRIM(email), '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$')
+        CASE WHEN regexp_matches(TRIM(email), '^[^@\s]+@[^@\s]+\.[^@\s]+$')
              THEN LEFT(TRIM(email), 2) || '***@' || split_part(TRIM(email), '@', 2)
              ELSE '***' END AS email,
         CASE WHEN LENGTH(regexp_replace(TRIM(phone), '[^0-9]', '', 'g')) >= 2
@@ -35,9 +45,14 @@ SELECT *, CASE WHEN customer_id IS NULL OR signup_date IS NULL OR signup_date > 
 FROM typed;
 
 CREATE OR REPLACE TABLE stg_products AS
-WITH source_rows AS (
+WITH latest_load AS (
+    SELECT MAX(_loaded_at) AS latest_loaded_at FROM raw_products
+), current_rows AS (
+    SELECT r.* FROM raw_products r
+    JOIN latest_load l ON r._loaded_at = l.latest_loaded_at
+), source_rows AS (
     SELECT *, COUNT(DISTINCT md5(concat_ws('|', product_id, product_name, category, sub_category, brand, mrp, cost_price, unit, is_perishable, launch_date))) OVER (PARTITION BY product_id) AS source_duplicate_versions
-    FROM raw_products
+    FROM current_rows
 ), ranked AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
     FROM source_rows
@@ -56,9 +71,14 @@ SELECT *, CASE WHEN product_id IS NULL OR category IS NULL OR mrp IS NULL OR mrp
 FROM typed;
 
 CREATE OR REPLACE TABLE stg_stores AS
-WITH ranked AS (
+WITH latest_load AS (
+    SELECT MAX(_loaded_at) AS latest_loaded_at FROM raw_stores
+), current_rows AS (
+    SELECT r.* FROM raw_stores r
+    JOIN latest_load l ON r._loaded_at = l.latest_loaded_at
+), ranked AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY store_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
-    FROM raw_stores
+    FROM current_rows
 ), typed AS (
     SELECT NULLIF(TRIM(store_id), '') AS store_id, NULLIF(TRIM(store_name), '') AS store_name,
            NULLIF(TRIM(zone), '') AS zone, NULLIF(TRIM(area), '') AS area,
@@ -74,9 +94,14 @@ SELECT *, CASE WHEN store_id IS NULL OR zone IS NULL OR open_date IS NULL THEN '
 FROM typed;
 
 CREATE OR REPLACE TABLE stg_payments AS
-WITH ranked AS (
+WITH latest_load AS (
+    SELECT MAX(_loaded_at) AS latest_loaded_at FROM raw_payments
+), current_rows AS (
+    SELECT r.* FROM raw_payments r
+    JOIN latest_load l ON r._loaded_at = l.latest_loaded_at
+), ranked AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY payment_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
-    FROM raw_payments
+    FROM current_rows
 ), typed AS (
     SELECT NULLIF(TRIM(payment_id), '') AS payment_id, NULLIF(TRIM(order_id), '') AS order_id,
            TRY_CAST(NULLIF(TRIM(payment_ts), '') AS TIMESTAMP) AS payment_ts,
@@ -91,9 +116,19 @@ SELECT *, CASE WHEN payment_id IS NULL OR order_id IS NULL OR payment_ts IS NULL
 FROM typed;
 
 CREATE OR REPLACE TABLE stg_orders_snapshot AS
-WITH source_rows AS (
-    SELECT *, COUNT(DISTINCT md5(concat_ws('|', order_id, order_ts, customer_id, store_id, product_id, quantity, unit_price, discount_pct, order_amount, payment_mode, order_status, channel, delivery_minutes))) OVER (PARTITION BY order_id) AS source_duplicate_versions
+WITH latest_load AS (
+    SELECT _source_file, MAX(_loaded_at) AS latest_loaded_at
     FROM raw_orders
+    GROUP BY _source_file
+), current_rows AS (
+    SELECT r.*
+    FROM raw_orders r
+    JOIN latest_load l
+      ON r._source_file = l._source_file
+     AND r._loaded_at = l.latest_loaded_at
+), source_rows AS (
+    SELECT *, COUNT(DISTINCT md5(concat_ws('|', order_id, order_ts, customer_id, store_id, product_id, quantity, unit_price, discount_pct, order_amount, payment_mode, order_status, channel, delivery_minutes))) OVER (PARTITION BY order_id) AS source_duplicate_versions
+    FROM current_rows
 ), ranked AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
     FROM source_rows

@@ -99,6 +99,34 @@ def _mask_phone(value: str) -> str:
     return f"{'*' * max(len(value) - 2, 0)}{value[-2:]}" if value else "***"
 
 
+def _mask_name(value: str) -> str:
+    """Reduce a customer name to initials so rejected rows carry no identifier."""
+    parts = [part for part in str(value).split() if part]
+    if not parts:
+        return "***"
+    return " ".join(f"{part[0]}***" for part in parts)
+
+
+# Direct identifiers are masked in every quarantine file so that rejected
+# customer rows can be reviewed without republishing personal data.
+QUARANTINE_MASKED_COLUMNS = {
+    "customers": {"full_name": _mask_name, "email": _mask_email, "phone": _mask_phone},
+}
+
+
+def _as_of_date() -> pd.Timestamp:
+    """Return the reference date used by the freshness checks.
+
+    Defaults to the current run date in Asia/Kolkata and can be pinned with
+    the NAMMAMART_AS_OF_DATE environment variable so a historical run can be
+    reproduced exactly.
+    """
+    configured = os.environ.get("NAMMAMART_AS_OF_DATE")
+    if configured:
+        return pd.Timestamp(configured).normalize()
+    return pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None).normalize()
+
+
 def _dq_row(check_name, dimension, severity, rows_checked, rows_failed, run_id, dag_id):
     """Create one scorecard record for a Python data-quality check."""
     status = "PASS" if rows_failed == 0 else "WARN" if severity == "Warning" else "FAIL"
@@ -321,8 +349,18 @@ def nammamart_etl_rudin():
         )
         order_mrp = orders["product_id"].map(product_mrp)
         price_distribution_drift = order_unit_price > (2 * order_mrp)
-        stale_cutoff = order_ts.max() - pd.Timedelta(days=30) if order_ts.notna().any() else pd.Timestamp.max
+        # A stale row is an outlier far behind the middle of the current
+        # snapshot. Comparing against the median keeps one bad timestamp from
+        # masking the file and stops a full month of valid history from being
+        # reported as stale.
+        median_order_ts = order_ts.quantile(0.5) if order_ts.notna().any() else pd.Timestamp.max
+        stale_cutoff = median_order_ts - pd.Timedelta(days=30)
         stale_orders = order_ts < stale_cutoff
+        # The client rule for timeliness: the newest order in the snapshot
+        # must not be older than one day at run time.
+        as_of_date = _as_of_date()
+        latest_order_ts = order_ts.max() if order_ts.notna().any() else pd.NaT
+        snapshot_stale = 1 if (pd.isna(latest_order_ts) or latest_order_ts < as_of_date - pd.Timedelta(days=1)) else 0
         signup_date = pd.to_datetime(customers["signup_date"], errors="coerce")
         payment_paid = pd.to_numeric(payments["amount_paid"], errors="coerce")
         payment_expected = payments["order_id"].map(order_amounts).pipe(pd.to_numeric, errors="coerce")
@@ -342,7 +380,7 @@ def nammamart_etl_rudin():
             _dq_row("allowed_values_and_formats", "Validity", "Critical", len(orders) + len(payments),
                     failed_count(orders, ~order_status.isin(ALLOWED_STATUS), ~order_modes.isin(ALLOWED_PAYMENT_MODES), order_ts.isna()) + failed_count(payments, ~payment_modes.isin(ALLOWED_PAYMENT_MODES), pd.to_datetime(payments.payment_ts, errors="coerce").isna()), run_id, dag_id),
             _dq_row("pii_format", "Validity", "Warning", len(customers),
-                    failed_count(customers, ~email_values.str.match(r"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", na=False), ~phone_values.str.match(r"^\\d{10}$", na=False)), run_id, dag_id),
+                    failed_count(customers, ~email_values.str.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", na=False), ~phone_values.str.match(r"^\d{10}$", na=False)), run_id, dag_id),
             _dq_row("numeric_business_rules", "Accuracy", "Critical", len(orders) + len(products),
                     failed_count(orders, order_quantity.isna() | (order_quantity <= 0), order_discount.isna() | ~order_discount.between(0, 100), (order_amount - expected_amount).abs() > 0.01, order_delivery.notna() & (order_delivery >= 120)) + failed_count(products, pd.to_numeric(products.mrp, errors="coerce").isna() | (pd.to_numeric(products.mrp, errors="coerce") <= 0), pd.to_numeric(products.cost_price, errors="coerce") > pd.to_numeric(products.mrp, errors="coerce")), run_id, dag_id),
             _dq_row("foreign_keys_and_payment_match", "Consistency", "Critical", len(orders) + len(payments),
@@ -352,6 +390,7 @@ def nammamart_etl_rudin():
             _dq_row("order_volume_drop", "Volume", "Warning", len(orders), int(len(orders) < MINIMUM_ORDER_VOLUME), run_id, dag_id),
             _dq_row("price_distribution_drift", "Distribution", "Warning", len(orders), failed_count(orders, price_distribution_drift), run_id, dag_id),
             _dq_row("stale_orders", "Timeliness", "Warning", len(orders), failed_count(orders, stale_orders), run_id, dag_id),
+            _dq_row("stale_snapshot", "Timeliness", "Warning", len(orders), snapshot_stale, run_id, dag_id),
         ]
         con = duckdb.connect(WAREHOUSE_DB)
         con.execute("""CREATE TABLE IF NOT EXISTS dq_results (
@@ -377,7 +416,13 @@ def nammamart_etl_rudin():
     # -------------------- QUARANTINE: preserve failed rows ------------------
     @task
     def quarantine(validation_result):
-        """Write every failed row to a run-specific CSV with its reason."""
+        """Write every failed row to a run-specific CSV with its reason.
+
+        Direct identifiers in customer rows are masked before the file is
+        written, so the repository never holds unmasked customer data. The
+        untouched source row stays available in the raw ELT layer and in the
+        read-only source export.
+        """
         context = get_current_context()
         run_id = context["run_id"].replace(":", "_")
         os.makedirs(QUARANTINE_DIR, exist_ok=True)
@@ -386,6 +431,9 @@ def nammamart_etl_rudin():
             failed = _read_json(result["failed"])
             if failed.empty:
                 continue
+            for column, masker in QUARANTINE_MASKED_COLUMNS.get(name, {}).items():
+                if column in failed.columns:
+                    failed[column] = failed[column].map(masker)
             path = f"{QUARANTINE_DIR}/{name}_failed_{run_id}.csv"
             failed.to_csv(path, index=False)
             total_failed += len(failed)
