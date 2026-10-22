@@ -64,7 +64,21 @@ In ETL, the rejected row is written to `include/quarantine/rudin/<file>_failed_<
 
 In ELT, the exact source row remains in `raw_orders`; the SQL staging table records `dq_status = 'FAIL'` and `failure_reason`, and every mart filters to passing rows. This gives Finance both the original row and proof that it cannot contribute to `mart_daily_store_kpis` or `mart_category_margin`.
 
-### 9. Change history
+### 9. Scheduling
+
+Both DAGs use the same schedule:
+
+```text
+0 9 * * 1-6
+```
+
+This means Monday through Saturday at 9:00 AM. The DAG definitions use a timezone-aware `Asia/Kolkata` start date, so the intended business run is **9:00 AM IST**. Airflow displays the equivalent scheduled time as **03:30 UTC** because India Standard Time is UTC+05:30.
+
+Both DAGs also use `catchup=False`. If Docker or the development laptop is offline at 9:00 AM IST, Airflow does not automatically recreate the missed run when the environment comes back online. This is intentional because the morning report should process the current scheduled source snapshot rather than replay every missed schedule. A missed run can still be triggered manually when the source files and environment are available.
+
+Reliability settings are shared by both DAGs: two retries, a two-minute retry delay, a 30-minute execution timeout, and `max_active_runs=1`. The retry settings allow transient failures to recover, the timeout prevents a stuck task from running indefinitely, and the single-active-run limit prevents overlapping writes to the DuckDB warehouses.
+
+### 10. Change history
 
 When an order changes from `DELIVERED` on 3 September to `RETURNED` on 1 October, the ELT raw layer keeps both received records, while the staging `MERGE` makes the latest returned version the current `order_id` state. September current-state revenue therefore excludes the returned order; Finance may also need an as-reported historical view that preserves the original September result.
 
