@@ -249,6 +249,16 @@ Sameer,
 
 I recommend ELT as NammaMart's primary analytical architecture, with the SQL staging-to-mart boundary treated as the finance control point. The ELT pipeline keeps every source record in `raw_*` tables exactly as received, then applies typed, documented SQL transformations before data reaches the marts. This gives Analytics and Compliance the auditability they requested while still ensuring that Finance reads only rows with `dq_status = 'PASS'`.
 
+| Decision criterion | ETL observation | ELT observation and decision |
+|---|---|---|
+| Auditability | Quarantine preserves rejected rows, but raw replay requires separate files | Raw rows retain `_source_file`, `_loaded_at`, and `_run_id`; ELT is stronger |
+| Data-quality guarantees | Strongest pre-load protection because invalid rows never enter fact tables | Quality-gated staging and mart filters provide the same reporting protection while retaining failed rows |
+| Ease of change | New rules and metrics require Python changes and retesting | SQL staging/marts can evolve while raw history remains unchanged; ELT is easier to change |
+| Performance at 1,000× growth | Python validation and file movement become a bottleneck unless rewritten for distributed execution | Partitioned raw storage, incremental SQL models, and `MERGE` provide the clearer scale path |
+| Cost | Less raw warehouse storage, but more custom validation and maintenance | More storage and scan cost, offset by open-source tooling, replayability, and lower transformation-maintenance cost |
+
+The recommendation is therefore ELT for the analytical platform, with a governed reporting boundary: raw data is restricted, staging quality checks are mandatory, critical failures are excluded from marts, and Finance consumes only reconciled, quality-passed models. ETL remains appropriate for a narrow operational export where the only acceptable output is a pre-validated file.
+
 The profiling results support this choice. The six source files contained malformed values, duplicate keys, missing relationships, invalid amounts, impossible delivery times, and future dates. The ELT design preserved those records instead of destroying evidence, while staging recorded `dq_status` and `failure_reason`. The incremental test also behaved as required: the 10 existing order IDs were treated as corrections, the 150 new IDs were inserted, and the staged order count stayed stable on a rerun. The SQL `MERGE` makes the current operational state reproducible while raw history remains available for replay.
 
 ### Auditability and data-quality guarantees
