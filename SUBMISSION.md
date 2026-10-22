@@ -224,6 +224,23 @@ HAVING COUNT(*) > 1;
 
 The strongest pillars are lineage and freshness because every ELT raw row carries source metadata and every run records timing and quality results. Distribution is currently weakest because the implementation logs delivery-range anomalies but does not yet persist broad statistical baselines for every numeric field.
 
+## Step 9 — Six business questions
+
+The executable SQL for both warehouse implementations is in [include/sql/nammamart_business_questions.sql](./include/sql/nammamart_business_questions.sql). The ETL statements use the `etl_*` fact, dimension, report, and reconciliation tables; the ELT statements use the SQL marts and quality-gated staging tables. No raw email or phone fields are selected in the customer result.
+
+The following results were captured after the clean full-load runs ETL `manual__2026-10-22T11:26:30.558523+00:00` and ELT `manual__2026-10-22T11:26:57.475476+00:00`:
+
+| Business question | ETL result | ELT result |
+|---|---|---|
+| Daily revenue by date, zone, and store | `etl_daily_zone_revenue` returned the required date/zone/store grain; first rows include 2026-09-01 East S08 = 2,984.70 and East S09 = 2,089.60 | `mart_daily_store_kpis` returned the same first rows and grain |
+| Revenue and gross margin by category | Delivered revenue = 1,025,529.40; gross margin = 252,303.30; category rows are in `etl_category_margin` | Delivered revenue = 1,025,107.60; gross margin = 252,223.20; category rows are in `mart_category_margin` |
+| Delivery average and 15-minute SLA | First stores: S01 = 20.62 minutes / 31.21%; S02 = 20.89 / 31.58%; S03 = 20.91 / 27.27% | `mart_delivery_sla` returned the same first-store values |
+| Payment-mode revenue and unreconciled amount | Payment reconciliation returned 543 unreconciled rows with total absolute difference 0.00; revenue is grouped by normalized payment mode | Payment reconciliation returned 786 rows with total absolute difference 475,156.10; revenue is grouped by payment mode in the ELT staging result |
+| Top 10 customers and loyalty tier | Top customer C00136, Bronze, 8,149.10; the remaining nine are returned by the ranked query | The same top 10 were returned; C00136/Bronze = 8,149.10 and C00115/Bronze = 7,337.70 |
+| Rejected rows by file and reason | Latest ETL run produced 148 quarantined rows across the five quarantine CSVs; each row includes `failure_reason` | Latest ELT staging result contained 490 failed rows grouped by `_source_file` and `failure_reason` |
+
+The current-state totals differ slightly between ETL and ELT because the ELT raw history retains late corrections and source versions, while ETL publishes the validated current fact snapshot. The September reconciliation comparison remains separately recorded above; the SQL queries are designed to expose the difference rather than hide it.
+
 ## Part G — Recommendation to Sameer, CTO
 
 ### Recommendation: adopt ELT with a governed reporting boundary
