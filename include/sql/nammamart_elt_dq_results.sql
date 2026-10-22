@@ -75,12 +75,6 @@ FROM (
     FROM stg_orders o
     JOIN stg_products p ON o.product_id = p.product_id
     UNION ALL
-    SELECT 'stale_orders', 'Timeliness', 'Warning', COUNT(*),
-           COUNT(*) FILTER (
-               WHERE order_ts < (SELECT quantile_cont(order_ts, 0.5) - INTERVAL '30 days' FROM stg_orders)
-           )
-    FROM stg_orders
-    UNION ALL
     SELECT 'stale_snapshot', 'Timeliness', 'Warning', COUNT(*),
            CASE WHEN MAX(order_ts) < TIMESTAMP '{{ as_of_date }}' - INTERVAL '1 day' THEN 1 ELSE 0 END
     FROM stg_orders

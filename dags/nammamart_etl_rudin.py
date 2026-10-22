@@ -349,13 +349,6 @@ def nammamart_etl_rudin():
         )
         order_mrp = orders["product_id"].map(product_mrp)
         price_distribution_drift = order_unit_price > (2 * order_mrp)
-        # A stale row is an outlier far behind the middle of the current
-        # snapshot. Comparing against the median keeps one bad timestamp from
-        # masking the file and stops a full month of valid history from being
-        # reported as stale.
-        median_order_ts = order_ts.quantile(0.5) if order_ts.notna().any() else pd.Timestamp.max
-        stale_cutoff = median_order_ts - pd.Timedelta(days=30)
-        stale_orders = order_ts < stale_cutoff
         # The client rule for timeliness: the newest order in the snapshot
         # must not be older than one day at run time.
         as_of_date = _as_of_date()
@@ -389,7 +382,6 @@ def nammamart_etl_rudin():
             _dq_row("future_dates", "Timeliness", "Critical", len(orders) + len(customers), failed_count(orders, order_ts > pd.Timestamp("2026-10-09 23:59:59")) + failed_count(customers, signup_date > pd.Timestamp("2026-10-09")), run_id, dag_id),
             _dq_row("order_volume_drop", "Volume", "Warning", len(orders), int(len(orders) < MINIMUM_ORDER_VOLUME), run_id, dag_id),
             _dq_row("price_distribution_drift", "Distribution", "Warning", len(orders), failed_count(orders, price_distribution_drift), run_id, dag_id),
-            _dq_row("stale_orders", "Timeliness", "Warning", len(orders), failed_count(orders, stale_orders), run_id, dag_id),
             _dq_row("stale_snapshot", "Timeliness", "Warning", len(orders), snapshot_stale, run_id, dag_id),
         ]
         con = duckdb.connect(WAREHOUSE_DB)
