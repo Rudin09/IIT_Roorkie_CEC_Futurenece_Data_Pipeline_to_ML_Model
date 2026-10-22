@@ -312,7 +312,13 @@ def nammamart_etl_rudin():
         order_delivery = pd.to_numeric(orders["delivery_minutes"], errors="coerce")
         expected_amount = (order_quantity * order_unit_price * (1 - order_discount / 100)).round(2)
         order_ts = pd.to_datetime(orders["order_ts"], errors="coerce")
-        product_mrp = pd.to_numeric(products.set_index("product_id")["mrp"], errors="coerce")
+        # Duplicate product keys are a known source-quality issue. Use the
+        # same last-record-wins rule as the transform step before mapping MRP,
+        # so the DQ scorecard itself remains robust on duplicate inputs.
+        product_mrp = pd.to_numeric(
+            products.drop_duplicates("product_id", keep="last").set_index("product_id")["mrp"],
+            errors="coerce",
+        )
         order_mrp = orders["product_id"].map(product_mrp)
         price_distribution_drift = order_unit_price > (2 * order_mrp)
         stale_cutoff = order_ts.max() - pd.Timedelta(days=30) if order_ts.notna().any() else pd.Timestamp.max
