@@ -4,6 +4,7 @@ Run from the repository root with:
     python include/profile_nammamart.py
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -70,6 +71,18 @@ ALLOWED_STATUS = {"DELIVERED", "CANCELLED", "RETURNED"}
 ALLOWED_MODES = {"UPI", "Card", "Cash on Delivery", "Wallet"}
 
 
+def profiling_as_of_date() -> pd.Timestamp:
+    """Return the local date used to identify future-dated source records.
+
+    Set NAMMAMART_PROFILE_AS_OF_DATE to reproduce a historical profiling run;
+    otherwise use today's date in the client's Asia/Kolkata timezone.
+    """
+    configured_date = os.getenv("NAMMAMART_PROFILE_AS_OF_DATE")
+    if configured_date:
+        return pd.Timestamp(configured_date).normalize()
+    return pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+
+
 def blank(value: object) -> bool:
     """Return True when a source value is missing or contains only whitespace."""
     return value is None or str(value).strip() == ""
@@ -86,6 +99,7 @@ def add_issue(issues: list[dict[str, object]], file: str, key: object, column: s
 
 def main() -> None:
     """Copy source data, profile it, validate business rules, and write outputs."""
+    as_of_date = profiling_as_of_date()
     # Create the required directories and copy the untouched assignment exports
     # into the location expected by the later Airflow pipelines.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -182,7 +196,7 @@ def main() -> None:
         timestamp = pd.to_datetime(row.order_ts, errors="coerce")
         if pd.isna(timestamp):
             add_issue(issues, "orders.csv", key, "order_ts", "Timestamp cannot be parsed", "Validity", "order_ts must be a valid timestamp", "Critical")
-        elif timestamp > pd.Timestamp("2026-10-09 23:59:59"):
+        elif timestamp.normalize() > as_of_date:
             add_issue(issues, "orders.csv", key, "order_ts", "Future-dated order timestamp", "Timeliness", "Order timestamp must not be future dated", "Critical")
         delivery = pd.to_numeric(row.delivery_minutes, errors="coerce")
         if status == "DELIVERED" and pd.isna(delivery):
@@ -222,7 +236,7 @@ def main() -> None:
         signup = pd.to_datetime(row.signup_date, errors="coerce")
         if pd.isna(signup):
             add_issue(issues, "customers.csv", key, "signup_date", "Signup date cannot be parsed", "Validity", "signup_date must be a valid date", "Critical")
-        elif signup > pd.Timestamp("2026-10-09"):
+        elif signup.normalize() > as_of_date:
             add_issue(issues, "customers.csv", key, "signup_date", "Future-dated signup date", "Timeliness", "Signup date must not be future dated", "Critical")
 
     # Validate product completeness, price relationships, and launch dates.
@@ -260,11 +274,6 @@ def main() -> None:
         "Should negative quantity or an order_amount mismatch be treated as a rejected data-entry error, or can either represent a return/adjustment?",
         "When an order changes from DELIVERED to RETURNED, should September revenue be restated historically, or preserved as originally reported with a separate returns view?",
         "What retention period and role-based access policy should apply to raw customer PII, quarantine files, and masked reporting tables?",
-        "When duplicate order, payment, customer, or product keys occur, which source row should be treated as authoritative?",
-        "Are blank gateway_ref values acceptable for Cash on Delivery payments, or must every successful payment have a gateway reference?",
-        "Should values such as cod, Cashh, and UPI with trailing spaces be standardized automatically, or rejected for source-system correction?",
-        "Who owns the approval of quality rules such as the 120-minute delivery limit and the SUCCESS-payment reconciliation rule?",
-        "What is the required response when a source file changes schema or arrives late: fail the run, retry, or use the previous successful file?",
     ]}).to_csv(OUTPUT_DIR / "client_questions.csv", index=False)
     print(f"Copied {len(FILES)} files to {DATA_DIR}")
     print(f"Profile rows: {len(profile)} -> {OUTPUT_DIR / 'profile_summary.csv'}")

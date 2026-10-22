@@ -81,6 +81,27 @@ rows_loaded, rows_quarantined, status
 
 The ETL audit counts source extracts, clean fact rows, and quarantine rows. The ELT audit counts raw rows loaded, current staged orders, and rows rejected from staging. A run is marked `failed` when any upstream task is not successful or skipped, including runs where a source file is missing or a schema change causes a task failure.
 
+### Latest ETL/ELT verification
+
+Both DAGs were rerun successfully on 22 October 2026:
+
+| DAG | Run ID | Status | Rows extracted | Rows loaded | Rows quarantined |
+|---|---|---|---:|---:|---:|
+| `nammamart_etl_rudin` | `manual__2026-10-22T08:26:57.782615+00:00` | success | 5,350 | 2,087 | 149 |
+| `nammamart_elt_rudin` | `manual__2026-10-22T08:27:08.281051+00:00` | success | 5,372 | 2,550 | 486 |
+
+The ELT incremental audit records **150 inserts and 10 updates** for `orders_2026-10-01_increment.csv`. Staging contains 2,550 unique orders and no duplicate `order_id` values.
+
+Both derived warehouses were reset and fully reloaded from the source snapshot. The September source data remains available for the required historical reporting, while reconciliation is scoped to October only. Source CSVs remain untouched; the clean full load also rebuilt raw ELT tables, quarantine outputs, audit history, and quality logs.
+
+The comparison scope is now October delivered revenue:
+
+| Metric | ETL orders | ELT orders | ETL revenue | ELT revenue | Status |
+|---|---:|---:|---:|---:|---|
+| October delivered revenue | 128 | 128 | 68,798.20 | 68,798.20 | MATCH |
+
+The full-load comparison now matches. ETL reads the base export plus the October incremental file, applies incremental rows as the latest version for each `order_id`, and publishes 128 valid October delivered orders worth 68,798.20. ELT publishes the same 128 orders and revenue. The one previously inconsistent future-dated order is rejected by both pipelines under the aligned `2026-10-09` cutoff.
+
 ### Experiment log
 
 Run each experiment separately in Airflow, restore the original source file after each test, and record the run ID from the DAG run page. The table below defines the expected observation, evidence location, and follow-up. The `Observed` value should be filled with the actual UI/log/table result for the submitted run.

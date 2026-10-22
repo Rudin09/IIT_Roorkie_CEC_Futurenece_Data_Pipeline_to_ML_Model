@@ -34,10 +34,8 @@ orders.csv,ORD000701,customer_id,customer_id is blank,Completeness,Order custome
 orders.csv,ORD001800,delivery_minutes,Delivered order has no delivery time,Completeness,DELIVERED orders require delivery_minutes,Critical
 orders.csv,ORD000403,order_ts,Timestamp cannot be parsed,Validity,order_ts must be a valid timestamp,Critical
 orders.csv,ORD001037,delivery_minutes,Implausible delivery time: 480 minutes,Accuracy,Delivery time must be below 120 minutes,Critical
-orders.csv,ORD001693,order_ts,Future-dated order timestamp,Timeliness,Order timestamp must not be future dated,Critical
 orders.csv,ORD001058,product_id,product_id does not exist,Consistency,Order product_id must exist in products,Critical
 orders.csv,ORD002305,order_amount,Amount 6757.5 does not match calculated amount 675.75,Accuracy,"order_amount = quantity * unit_price * (1 - discount_pct/100), rounded to 2 decimals",Critical
-orders.csv,ORD001089,order_ts,Future-dated order timestamp,Timeliness,Order timestamp must not be future dated,Critical
 orders.csv,ORD001121,order_ts,Future-dated order timestamp,Timeliness,Order timestamp must not be future dated,Critical
 orders.csv,ORD002004,order_amount,Amount 6720.0 does not match calculated amount 672.0,Accuracy,"order_amount = quantity * unit_price * (1 - discount_pct/100), rounded to 2 decimals",Critical
 orders.csv,ORD002101,delivery_minutes,Implausible delivery time: 480 minutes,Accuracy,Delivery time must be below 120 minutes,Critical

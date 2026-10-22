@@ -27,6 +27,7 @@ SQL_DIR = "/usr/local/airflow/include/sql"
 # Keep ELT storage separate from the ETL warehouse so scheduled or manual runs
 # can execute side by side without DuckDB file-lock contention.
 WAREHOUSE_DB = "/usr/local/airflow/include/warehouse_rudin_elt.duckdb"
+ETL_WAREHOUSE_DB = "/usr/local/airflow/include/warehouse_rudin.duckdb"
 
 default_args = {
     "owner": "fde-cohort",
@@ -113,9 +114,35 @@ def nammamart_elt_rudin():
         """MERGE the latest raw order version into persistent staging."""
         context = get_current_context()
         con = duckdb.connect(WAREHOUSE_DB)
+        inserted_count, updated_count = con.execute("""
+            WITH increment_ids AS (
+                SELECT DISTINCT order_id
+                FROM raw_orders
+                WHERE _source_file = 'orders_2026-10-01_increment.csv'
+            ), base_ids AS (
+                SELECT DISTINCT order_id
+                FROM raw_orders
+                WHERE _source_file = 'orders.csv'
+            )
+            SELECT
+                COUNT(*) FILTER (WHERE b.order_id IS NULL),
+                COUNT(*) FILTER (WHERE b.order_id IS NOT NULL)
+            FROM increment_ids i
+            LEFT JOIN base_ids b USING (order_id)
+        """).fetchone()
         _execute_sql(con, "nammamart_elt_orders_upsert.sql", context["run_id"], context["dag"].dag_id)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS elt_incremental_audit (
+                run_id VARCHAR, source_file VARCHAR, inserted_count BIGINT,
+                updated_count BIGINT, recorded_at TIMESTAMP
+            )
+        """)
+        con.execute("INSERT INTO elt_incremental_audit VALUES (?, ?, ?, ?, ?)", [
+            context["run_id"], "orders_2026-10-01_increment.csv",
+            inserted_count, updated_count, pendulum.now("UTC"),
+        ])
         counts = con.execute("SELECT COUNT(*) AS total_orders, COUNT(*) FILTER (WHERE order_status = 'RETURNED') AS returned_orders FROM stg_orders").fetchone()
-        print(f"[Staging][MERGE] stg_orders={counts[0]} rows; returned={counts[1]}")
+        print(f"[Staging][MERGE] stg_orders={counts[0]} rows; returned={counts[1]}; inserted={inserted_count}; updated={updated_count}")
         con.close()
         return staging_complete
 
@@ -146,6 +173,57 @@ def nammamart_elt_rudin():
             print(f"[Mart] {table_name}: {row_count} rows")
         con.close()
         return True
+
+    @task
+    def compare_etl_totals(marts_complete):
+        """Persist an October-only delivered-revenue comparison with ETL."""
+        context = get_current_context()
+        con = duckdb.connect(WAREHOUSE_DB)
+        con.execute(f"ATTACH '{ETL_WAREHOUSE_DB}' AS etl_db (READ_ONLY)")
+        con.execute("DROP TABLE IF EXISTS elt_etl_september_reconciliation")
+        con.execute("""
+            CREATE OR REPLACE TABLE elt_etl_october_reconciliation AS
+            SELECT
+                'October delivered revenue' AS metric,
+                (SELECT COUNT(*) FROM etl_db.etl_fact_orders
+                 WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                   AND CAST(order_date AS DATE) < DATE '2026-11-01') AS etl_order_count,
+                (SELECT COUNT(*) FROM stg_orders
+                 WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                   AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                   AND CAST(order_date AS DATE) < DATE '2026-11-01') AS elt_order_count,
+                (SELECT SUM(net_revenue) FROM etl_db.etl_fact_orders
+                 WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                   AND CAST(order_date AS DATE) < DATE '2026-11-01') AS etl_value,
+                (SELECT SUM(net_revenue) FROM stg_orders
+                 WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                   AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                   AND CAST(order_date AS DATE) < DATE '2026-11-01') AS elt_value,
+                (SELECT SUM(net_revenue) FROM stg_orders
+                 WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                   AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                   AND CAST(order_date AS DATE) < DATE '2026-11-01')
+                - (SELECT SUM(net_revenue) FROM etl_db.etl_fact_orders
+                   WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                     AND CAST(order_date AS DATE) < DATE '2026-11-01') AS difference,
+                CASE WHEN (SELECT COUNT(*) FROM etl_db.etl_fact_orders
+                           WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                             AND CAST(order_date AS DATE) < DATE '2026-11-01') = 0
+                     THEN 'ETL_INCREMENT_NOT_LOADED'
+                     WHEN ABS(
+                    (SELECT SUM(net_revenue) FROM stg_orders
+                     WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                       AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                       AND CAST(order_date AS DATE) < DATE '2026-11-01')
+                    - (SELECT SUM(net_revenue) FROM etl_db.etl_fact_orders
+                       WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) >= DATE '2026-10-01'
+                         AND CAST(order_date AS DATE) < DATE '2026-11-01')
+                ) < 0.01 THEN 'MATCH' ELSE 'MISMATCH' END AS comparison_status,
+                CURRENT_TIMESTAMP AS compared_at
+        """)
+        print(con.execute("SELECT * FROM elt_etl_october_reconciliation").fetchdf().to_string(index=False))
+        con.close()
+        return marts_complete
 
     # -------------------- AUDIT: always record the run outcome ---------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
@@ -203,8 +281,9 @@ def nammamart_elt_rudin():
     upserted = apply_order_upsert(staging)
     dq = record_dq_results(upserted)
     marts = build_marts(dq)
+    compared = compare_etl_totals(marts)
     audit_task = audit_run()
-    marts >> audit_task
+    compared >> audit_task
 
 
 nammamart_elt_rudin()

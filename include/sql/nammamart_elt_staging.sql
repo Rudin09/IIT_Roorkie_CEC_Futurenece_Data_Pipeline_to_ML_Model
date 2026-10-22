@@ -3,10 +3,13 @@
 -- and row-level quality status decisions happen in this SQL transformation.
 
 CREATE OR REPLACE TABLE stg_customers AS
-WITH ranked AS (
+WITH source_rows AS (
+    SELECT *, COUNT(DISTINCT md5(concat_ws('|', customer_id, full_name, email, phone, city, area, pincode, signup_date, loyalty_tier, is_active))) OVER (PARTITION BY customer_id) AS source_duplicate_versions
+    FROM raw_customers
+), ranked AS (
     SELECT *,
            ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
-    FROM raw_customers
+    FROM source_rows
 ), typed AS (
     SELECT
         NULLIF(TRIM(customer_id), '') AS customer_id,
@@ -23,18 +26,21 @@ WITH ranked AS (
         TRY_CAST(NULLIF(TRIM(signup_date), '') AS DATE) AS signup_date,
         CASE UPPER(TRIM(loyalty_tier)) WHEN 'BRONZE' THEN 'Bronze' WHEN 'SILVER' THEN 'Silver' WHEN 'GOLD' THEN 'Gold' WHEN 'PLATINUM' THEN 'Platinum' ELSE TRIM(loyalty_tier) END AS loyalty_tier,
         UPPER(TRIM(is_active)) AS is_active,
-        _loaded_at, _source_file, _run_id
+        _loaded_at, _source_file, _run_id, source_duplicate_versions
     FROM ranked
     WHERE record_rank = 1
 )
-SELECT *, CASE WHEN customer_id IS NULL OR signup_date IS NULL THEN 'FAIL' ELSE 'PASS' END AS dq_status,
-       CASE WHEN customer_id IS NULL THEN 'customer_id missing' WHEN signup_date IS NULL THEN 'invalid signup_date' ELSE NULL END AS failure_reason
+SELECT *, CASE WHEN customer_id IS NULL OR signup_date IS NULL OR signup_date > CURRENT_DATE OR source_duplicate_versions > 1 THEN 'FAIL' ELSE 'PASS' END AS dq_status,
+       CASE WHEN customer_id IS NULL THEN 'customer_id missing' WHEN signup_date IS NULL THEN 'invalid signup_date' WHEN signup_date > CURRENT_DATE THEN 'future signup_date' WHEN source_duplicate_versions > 1 THEN 'duplicate customer_id' ELSE NULL END AS failure_reason
 FROM typed;
 
 CREATE OR REPLACE TABLE stg_products AS
-WITH ranked AS (
-    SELECT *, ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
+WITH source_rows AS (
+    SELECT *, COUNT(DISTINCT md5(concat_ws('|', product_id, product_name, category, sub_category, brand, mrp, cost_price, unit, is_perishable, launch_date))) OVER (PARTITION BY product_id) AS source_duplicate_versions
     FROM raw_products
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
+    FROM source_rows
 ), typed AS (
     SELECT NULLIF(TRIM(product_id), '') AS product_id, NULLIF(TRIM(product_name), '') AS product_name,
            NULLIF(TRIM(category), '') AS category, NULLIF(TRIM(sub_category), '') AS sub_category,
@@ -42,11 +48,11 @@ WITH ranked AS (
            TRY_CAST(NULLIF(TRIM(cost_price), '') AS DECIMAL(12, 2)) AS cost_price,
            NULLIF(TRIM(unit), '') AS unit, LOWER(TRIM(is_perishable)) = 'true' AS is_perishable,
            TRY_CAST(NULLIF(TRIM(launch_date), '') AS DATE) AS launch_date,
-           _loaded_at, _source_file, _run_id
+           _loaded_at, _source_file, _run_id, source_duplicate_versions
     FROM ranked WHERE record_rank = 1
 )
-SELECT *, CASE WHEN product_id IS NULL OR category IS NULL OR mrp IS NULL OR mrp <= 0 OR cost_price > mrp THEN 'FAIL' ELSE 'PASS' END AS dq_status,
-       CASE WHEN product_id IS NULL THEN 'product_id missing' WHEN category IS NULL THEN 'category missing' WHEN mrp IS NULL OR mrp <= 0 THEN 'invalid mrp' WHEN cost_price > mrp THEN 'cost_price exceeds mrp' ELSE NULL END AS failure_reason
+SELECT *, CASE WHEN product_id IS NULL OR category IS NULL OR mrp IS NULL OR mrp <= 0 OR cost_price > mrp OR source_duplicate_versions > 1 THEN 'FAIL' ELSE 'PASS' END AS dq_status,
+       CASE WHEN product_id IS NULL THEN 'product_id missing' WHEN category IS NULL THEN 'category missing' WHEN mrp IS NULL OR mrp <= 0 THEN 'invalid mrp' WHEN cost_price > mrp THEN 'cost_price exceeds mrp' WHEN source_duplicate_versions > 1 THEN 'duplicate product_id' ELSE NULL END AS failure_reason
 FROM typed;
 
 CREATE OR REPLACE TABLE stg_stores AS
@@ -85,9 +91,12 @@ SELECT *, CASE WHEN payment_id IS NULL OR order_id IS NULL OR payment_ts IS NULL
 FROM typed;
 
 CREATE OR REPLACE TABLE stg_orders_snapshot AS
-WITH ranked AS (
-    SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
+WITH source_rows AS (
+    SELECT *, COUNT(DISTINCT md5(concat_ws('|', order_id, order_ts, customer_id, store_id, product_id, quantity, unit_price, discount_pct, order_amount, payment_mode, order_status, channel, delivery_minutes))) OVER (PARTITION BY order_id) AS source_duplicate_versions
     FROM raw_orders
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY TRY_CAST(_loaded_at AS TIMESTAMP) DESC, _run_id DESC) AS record_rank
+    FROM source_rows
 ), typed AS (
     SELECT NULLIF(TRIM(order_id), '') AS order_id, TRY_CAST(NULLIF(TRIM(order_ts), '') AS TIMESTAMP) AS order_ts,
            NULLIF(TRIM(customer_id), '') AS customer_id, NULLIF(TRIM(store_id), '') AS store_id,
@@ -98,12 +107,14 @@ WITH ranked AS (
            CASE LOWER(TRIM(payment_mode)) WHEN 'upi' THEN 'UPI' WHEN 'cod' THEN 'Cash on Delivery' WHEN 'cash on delivery' THEN 'Cash on Delivery' ELSE TRIM(payment_mode) END AS payment_mode,
            UPPER(TRIM(order_status)) AS order_status, TRIM(channel) AS channel,
            TRY_CAST(NULLIF(TRIM(delivery_minutes), '') AS INTEGER) AS delivery_minutes,
-           _loaded_at, _source_file, _run_id
+           _loaded_at, _source_file, _run_id, source_duplicate_versions
     FROM ranked WHERE record_rank = 1
 ), checked AS (
     SELECT t.*,
            CASE WHEN t.order_id IS NULL THEN 'order_id missing'
+                WHEN t.source_duplicate_versions > 1 AND t._source_file = 'orders.csv' THEN 'duplicate order_id'
                 WHEN order_ts IS NULL THEN 'invalid order_ts'
+                WHEN order_ts > TIMESTAMP '2026-10-09 23:59:59' THEN 'future order_ts'
                 WHEN t.customer_id IS NULL OR c.customer_id IS NULL THEN 'customer_id missing or unknown'
                 WHEN t.store_id IS NULL OR s.store_id IS NULL THEN 'store_id missing or unknown'
                 WHEN t.product_id IS NULL OR p.product_id IS NULL THEN 'product_id missing or unknown'
@@ -120,7 +131,7 @@ WITH ranked AS (
     LEFT JOIN stg_stores s ON t.store_id = s.store_id AND s.dq_status = 'PASS'
     LEFT JOIN stg_products p ON t.product_id = p.product_id AND p.dq_status = 'PASS'
 )
-SELECT *, CAST(order_ts AS DATE) AS order_date,
+SELECT * EXCLUDE (source_duplicate_versions), CAST(order_ts AS DATE) AS order_date,
        CASE WHEN order_status = 'DELIVERED' THEN order_amount ELSE 0 END AS net_revenue,
        CASE WHEN order_status = 'DELIVERED' AND delivery_minutes <= 15 THEN TRUE ELSE FALSE END AS within_15_min,
        CASE WHEN failure_reason IS NULL THEN 'PASS' ELSE 'FAIL' END AS dq_status

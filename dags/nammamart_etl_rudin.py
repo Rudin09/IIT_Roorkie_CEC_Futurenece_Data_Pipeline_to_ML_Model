@@ -100,13 +100,34 @@ def _dq_row(check_name, dimension, severity, rows_checked, rows_failed, run_id, 
     tags=["fde", "nammamart", "etl"],
 )
 def nammamart_etl_rudin():
-    # -------------------- EXTRACT: five independent tasks --------------------
+    # -------------------- EXTRACT: full orders snapshot ----------------------
     # Each task returns its own JSON payload, so Airflow can run all five
     # source reads in parallel and pass the results through XCom.
     @task
     def extract_orders():
-        frame = pd.read_csv(f"{DATA_DIR}/orders.csv", dtype=str, keep_default_na=False)
-        print(f"[Extract] orders.csv: {len(frame)} rows")
+        base = pd.read_csv(f"{DATA_DIR}/orders.csv", dtype=str, keep_default_na=False)
+        increment = pd.read_csv(
+            f"{DATA_DIR}/orders_2026-10-01_increment.csv",
+            dtype=str,
+            keep_default_na=False,
+        )
+        # Full-load parity: the incremental snapshot contains 10 corrections
+        # and 150 new orders. Keep the latest received version per order_id so
+        # ETL and ELT publish the same current-state order population.
+        base["_source_priority"] = 0
+        increment["_source_priority"] = 1
+        frame = pd.concat([base, increment], ignore_index=True)
+        frame = (
+            frame.sort_values(["order_id", "_source_priority"])
+            .drop_duplicates("order_id", keep="last")
+            .drop(columns=["_source_priority"])
+            .reset_index(drop=True)
+        )
+        print(
+            f"[Extract] orders.csv={len(base)} rows; "
+            f"orders_2026-10-01_increment.csv={len(increment)} rows; "
+            f"deduplicated full snapshot={len(frame)} rows"
+        )
         return _json_records(frame)
 
     @task
@@ -175,6 +196,7 @@ def nammamart_etl_rudin():
                 _add_failure(failures["orders"], index, "store_id is missing or unknown")
             status = str(row.order_status).strip().upper()
             mode = str(row.payment_mode).strip()
+            mode = {"upi": "UPI", "card": "Card", "cod": "Cash on Delivery", "cash on delivery": "Cash on Delivery", "wallet": "Wallet"}.get(mode.lower(), mode)
             if status not in ALLOWED_STATUS:
                 _add_failure(failures["orders"], index, f"invalid order_status: {row.order_status}")
             if mode not in ALLOWED_PAYMENT_MODES:
@@ -202,7 +224,9 @@ def nammamart_etl_rudin():
         # Payments: validate keys, allowed values, timestamps, and reconciliation.
         order_amounts = orders.groupby("order_id")["order_amount"].first()
         for index, row in payments.iterrows():
-            if str(row.payment_mode).strip() not in ALLOWED_PAYMENT_MODES:
+            payment_mode = str(row.payment_mode).strip()
+            payment_mode = {"upi": "UPI", "card": "Card", "cod": "Cash on Delivery", "cash on delivery": "Cash on Delivery", "wallet": "Wallet"}.get(payment_mode.lower(), payment_mode)
+            if payment_mode not in ALLOWED_PAYMENT_MODES:
                 _add_failure(failures["payments"], index, f"invalid payment_mode: {row.payment_mode}")
             if row.order_id not in order_ids:
                 _add_failure(failures["payments"], index, "payment references unknown order")
@@ -247,8 +271,8 @@ def nammamart_etl_rudin():
             return int(combined.sum())
 
         order_status = orders["order_status"].str.strip().str.upper()
-        order_modes = orders["payment_mode"].str.strip()
-        payment_modes = payments["payment_mode"].str.strip()
+        order_modes = orders["payment_mode"].str.strip().str.lower().replace({"upi": "UPI", "card": "Card", "cod": "Cash on Delivery", "cash on delivery": "Cash on Delivery", "wallet": "Wallet"})
+        payment_modes = payments["payment_mode"].str.strip().str.lower().replace({"upi": "UPI", "card": "Card", "cod": "Cash on Delivery", "cash on delivery": "Cash on Delivery", "wallet": "Wallet"})
         order_quantity = pd.to_numeric(orders["quantity"], errors="coerce")
         order_discount = pd.to_numeric(orders["discount_pct"], errors="coerce")
         order_amount = pd.to_numeric(orders["order_amount"], errors="coerce")
@@ -358,7 +382,10 @@ def nammamart_etl_rudin():
         orders["within_15_min"] = (orders["order_status"] == "DELIVERED") & (orders["delivery_minutes"] <= 15)
 
         # Join the clean fact rows to product cost and store/customer attributes.
-        fact = orders.merge(products[["product_id", "cost_price"]], on="product_id", how="left")
+        # Only orders whose product dimension passed validation may enter the
+        # finance fact table. A left join here would allow rejected products
+        # to reach etl_fact_orders with a null cost_price.
+        fact = orders.merge(products[["product_id", "cost_price"]], on="product_id", how="inner")
         fact = fact.merge(customers[["customer_id"]], on="customer_id", how="inner")
         fact = fact.merge(stores[["store_id"]], on="store_id", how="inner")
         fact["gross_margin"] = fact["net_revenue"] - (fact["quantity"] * fact["cost_price"])
