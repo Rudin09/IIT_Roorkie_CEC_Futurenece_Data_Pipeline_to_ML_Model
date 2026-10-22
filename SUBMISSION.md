@@ -172,6 +172,19 @@ Run each experiment separately in Airflow, restore the original source file afte
 
 Useful verification queries:
 
+### Final synchronized experiment status
+
+The following corrections supersede the earlier `pending` or generic descriptions in the experiment table above.
+
+| Experiment | Expected | Observed | Evidence location | Proposed improvement |
+|---|---|---|---|---|
+| 5. New bad data | Five invalid rows should be quarantined or excluded with rule-specific reasons | ETL quarantined the missing-customer, negative-quantity, unknown-store, invalid-status, and future-date rows. ELT completed `record_dq_results` and excluded failed staging rows from marts | ETL run `manual__2026-10-22T11:08:06.112611+00:00`; ELT run `manual__2026-10-22T11:08:22.380751+00:00`; `include/quarantine/rudin/orders_failed_manual__2026-10-22T11_08_06.112611+00_00.csv` | Add a reusable invalid-row fixture covering every critical rule |
+| 7. Volume anomaly | A major row-count drop should be visible and warned | The snapshot contained 210 rows, below the 255-row threshold; both pipelines completed and recorded `order_volume_drop` as a warning | ETL run `manual__2026-10-22T10:25:26.809025+00:00`; ELT run `manual__2026-10-22T10:25:38.220706+00:00`; `pipeline_runs` and `dq_results` | Persist a rolling baseline-volume check |
+| 8. Distribution drift | A large price change should affect the metric path and be detected | A 10× unit-price/order-amount mutation completed successfully through both DAGs; `price_distribution_drift` was evaluated by ETL and ELT `record_dq_results` | ETL run `manual__2026-10-22T11:13:33.905624+00:00`; ELT run `manual__2026-10-22T11:13:51.253434+00:00`; `dq_results` | Add percentile or z-score monitoring for unit-price drift |
+| 9. Freshness failure | A stale order should produce a freshness warning or failure | A `2020-01-01` order timestamp completed through both pipelines; `stale_orders` was evaluated and recorded by the timeliness checks | ETL run `manual__2026-10-22T11:16:39.931370+00:00`; ELT run `manual__2026-10-22T11:16:56.759808+00:00`; `dq_results` | Make the freshness threshold configurable |
+
+Useful verification queries:
+
 Experiment 7 was executed on 22 October 2026 by reducing `orders.csv` to 50 rows while retaining the 160-row increment. ETL run `manual__2026-10-22T10:25:26.809025+00:00` and ELT run `manual__2026-10-22T10:25:38.220706+00:00` completed successfully and recorded the `order_volume_drop` warning because the current snapshot was 210 rows, below the 255-row threshold. The original source file was restored afterward.
 
 Experiment 7 status correction: the main experiment row is superseded by the evidence above and should be treated as **completed**, not pending. The expected result, observed warning, run evidence, and improvement are all recorded here.
@@ -180,7 +193,11 @@ Experiment 5 was executed on 22 October 2026 by adding five invalid orders to `o
 
 Experiment 8 was executed on 22 October 2026 by multiplying one order's unit price and order amount by 10. ETL run `manual__2026-10-22T10:29:09.295941+00:00` and ELT run `manual__2026-10-22T10:29:19.339834+00:00` were submitted with the mutation; both pipelines contain the `price_distribution_drift` warning check, and the original source row was restored afterward. The check compares unit price with twice the product MRP and records the result in `dq_results`.
 
+Experiment 8 status correction: a corrected isolated run was completed on 22 October 2026 using the same 10x price mutation. ETL run `manual__2026-10-22T11:13:33.905624+00:00` and ELT run `manual__2026-10-22T11:13:51.253434+00:00` completed successfully. ETL validation, reporting, and audit succeeded; ELT `record_dq_results`, marts, reconciliation, and audit succeeded. The `price_distribution_drift` warning compares unit price with twice the product MRP, and the original source row was restored afterward.
+
 Experiment 9 was executed on 22 October 2026 by changing one order timestamp to `2020-01-01 00:00:00`. ETL run `manual__2026-10-22T10:30:27.272798+00:00` and ELT run `manual__2026-10-22T10:30:34.502377+00:00` were submitted with the stale timestamp; both pipelines contain the `stale_orders` timeliness warning check, and the original timestamp was restored afterward. The check compares each order with the latest order timestamp minus 30 days and records the result in `dq_results`.
+
+Experiment 9 status correction: a confirmed isolated run was completed on 22 October 2026 using the stale `2020-01-01 00:00:00` timestamp. ETL run `manual__2026-10-22T11:16:39.931370+00:00` and ELT run `manual__2026-10-22T11:16:56.759808+00:00` completed successfully. ETL reporting and audit succeeded; ELT `record_dq_results`, marts, reconciliation, and audit succeeded. The `stale_orders` warning compares each order with the latest order timestamp minus 30 days, and the original source timestamp was restored afterward.
 
 Experiment 10 recovery was completed by restoring `stores.csv` after the missing-file test. ETL run `manual__2026-10-22T09:21:11.099122+00:00` and ELT run `manual__2026-10-22T09:21:28.042564+00:00` both completed successfully.
 
