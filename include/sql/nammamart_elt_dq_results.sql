@@ -33,4 +33,20 @@ FROM (
     SELECT 'customer_pii_format', 'Validity', 'Warning', COUNT(*), COUNT(*) FILTER (WHERE NOT regexp_matches(TRIM(email), '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$') OR NOT regexp_matches(TRIM(phone), '^[0-9]{10}$')) FROM raw_customers
     UNION ALL
     SELECT 'delivery_normal_range', 'Accuracy', 'Warning', COUNT(*), COUNT(*) FILTER (WHERE TRY_CAST(delivery_minutes AS INTEGER) > 35 AND TRY_CAST(delivery_minutes AS INTEGER) < 120) FROM raw_orders
+    UNION ALL
+    SELECT 'order_volume_drop', 'Volume', 'Warning', COUNT(*),
+           CASE WHEN COUNT(*) < 255 THEN 1 ELSE 0 END
+    FROM raw_orders
+    WHERE _run_id = '{{ run_id }}'
+    UNION ALL
+    SELECT 'price_distribution_drift', 'Distribution', 'Warning', COUNT(*),
+           COUNT(*) FILTER (WHERE o.unit_price > 2 * p.mrp)
+    FROM stg_orders o
+    JOIN stg_products p ON o.product_id = p.product_id
+    UNION ALL
+    SELECT 'stale_orders', 'Timeliness', 'Warning', COUNT(*),
+           COUNT(*) FILTER (
+               WHERE order_ts < (SELECT MAX(order_ts) - INTERVAL '30 days' FROM stg_orders)
+           )
+    FROM stg_orders
 ) checks;

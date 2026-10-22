@@ -29,6 +29,15 @@ SQL_DIR = "/usr/local/airflow/include/sql"
 WAREHOUSE_DB = "/usr/local/airflow/include/warehouse_rudin_elt.duckdb"
 ETL_WAREHOUSE_DB = "/usr/local/airflow/include/warehouse_rudin.duckdb"
 
+REQUIRED_COLUMNS = {
+    "orders.csv": {"order_id", "order_ts", "customer_id", "store_id", "product_id", "quantity", "unit_price", "discount_pct", "order_amount", "payment_mode", "order_status", "channel", "delivery_minutes"},
+    "orders_2026-10-01_increment.csv": {"order_id", "order_ts", "customer_id", "store_id", "product_id", "quantity", "unit_price", "discount_pct", "order_amount", "payment_mode", "order_status", "channel", "delivery_minutes"},
+    "payments.csv": {"payment_id", "order_id", "payment_ts", "payment_mode", "amount_paid", "payment_status", "gateway_ref"},
+    "customers.csv": {"customer_id", "full_name", "email", "phone", "city", "area", "pincode", "signup_date", "loyalty_tier", "is_active"},
+    "products.csv": {"product_id", "product_name", "category", "sub_category", "brand", "mrp", "cost_price", "unit", "is_perishable", "launch_date"},
+    "stores.csv": {"store_id", "store_name", "zone", "area", "pincode", "open_date", "manager_name", "capacity_orders_per_day"},
+}
+
 default_args = {
     "owner": "fde-cohort",
     "retries": 2,
@@ -44,11 +53,19 @@ def _execute_sql(con, filename: str, run_id: str = "", dag_id: str = "") -> None
     con.execute(statement)
 
 
+def _assert_required_columns(frame: pd.DataFrame, filename: str) -> None:
+    """Fail before raw loading when a source contract changes."""
+    missing = REQUIRED_COLUMNS[filename] - set(frame.columns)
+    if missing:
+        raise ValueError(f"Schema validation failed for {filename}; missing columns: {sorted(missing)}")
+
+
 def _load_csv_to_raw(filename: str, table_name: str) -> int:
     """Append an untouched CSV snapshot to a raw table with audit metadata."""
     context = get_current_context()
     run_id = context["run_id"]
     frame = pd.read_csv(f"{DATA_DIR}/{filename}", dtype=str, keep_default_na=False)
+    _assert_required_columns(frame, filename)
     frame["_loaded_at"] = pendulum.now("UTC").to_iso8601_string()
     frame["_source_file"] = filename
     frame["_run_id"] = run_id

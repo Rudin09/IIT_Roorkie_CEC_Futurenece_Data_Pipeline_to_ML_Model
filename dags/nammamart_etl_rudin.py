@@ -30,6 +30,25 @@ QUARANTINE_DIR = "/usr/local/airflow/include/quarantine/rudin"
 
 ALLOWED_STATUS = {"DELIVERED", "CANCELLED", "RETURNED"}
 ALLOWED_PAYMENT_MODES = {"UPI", "Card", "Cash on Delivery", "Wallet"}
+EXPECTED_ORDER_ROWS = 2550
+MINIMUM_ORDER_VOLUME = int(EXPECTED_ORDER_ROWS * 0.10)
+
+REQUIRED_COLUMNS = {
+    "orders.csv": {
+        "order_id", "order_ts", "customer_id", "store_id", "product_id",
+        "quantity", "unit_price", "discount_pct", "order_amount", "payment_mode",
+        "order_status", "channel", "delivery_minutes",
+    },
+    "orders_2026-10-01_increment.csv": {
+        "order_id", "order_ts", "customer_id", "store_id", "product_id",
+        "quantity", "unit_price", "discount_pct", "order_amount", "payment_mode",
+        "order_status", "channel", "delivery_minutes",
+    },
+    "payments.csv": {"payment_id", "order_id", "payment_ts", "payment_mode", "amount_paid", "payment_status", "gateway_ref"},
+    "customers.csv": {"customer_id", "full_name", "email", "phone", "city", "area", "pincode", "signup_date", "loyalty_tier", "is_active"},
+    "products.csv": {"product_id", "product_name", "category", "sub_category", "brand", "mrp", "cost_price", "unit", "is_perishable", "launch_date"},
+    "stores.csv": {"store_id", "store_name", "zone", "area", "pincode", "open_date", "manager_name", "capacity_orders_per_day"},
+}
 
 default_args = {
     "owner": "fde-cohort",
@@ -47,6 +66,13 @@ def _read_json(value: str) -> pd.DataFrame:
 def _json_records(frame: pd.DataFrame) -> str:
     """Serialize a DataFrame without converting its columns into index keys."""
     return frame.to_json(orient="records", date_format="iso")
+
+
+def _assert_required_columns(frame: pd.DataFrame, filename: str) -> None:
+    """Fail fast on a source schema change instead of silently creating nulls."""
+    missing = REQUIRED_COLUMNS[filename] - set(frame.columns)
+    if missing:
+        raise ValueError(f"Schema validation failed for {filename}; missing columns: {sorted(missing)}")
 
 
 def _blank(value) -> bool:
@@ -111,6 +137,8 @@ def nammamart_etl_rudin():
             dtype=str,
             keep_default_na=False,
         )
+        _assert_required_columns(base, "orders.csv")
+        _assert_required_columns(increment, "orders_2026-10-01_increment.csv")
         # Full-load parity: the incremental snapshot contains 10 corrections
         # and 150 new orders. Keep the latest received version per order_id so
         # ETL and ELT publish the same current-state order population.
@@ -133,24 +161,28 @@ def nammamart_etl_rudin():
     @task
     def extract_payments():
         frame = pd.read_csv(f"{DATA_DIR}/payments.csv", dtype=str, keep_default_na=False)
+        _assert_required_columns(frame, "payments.csv")
         print(f"[Extract] payments.csv: {len(frame)} rows")
         return _json_records(frame)
 
     @task
     def extract_customers():
         frame = pd.read_csv(f"{DATA_DIR}/customers.csv", dtype=str, keep_default_na=False)
+        _assert_required_columns(frame, "customers.csv")
         print(f"[Extract] customers.csv: {len(frame)} rows")
         return _json_records(frame)
 
     @task
     def extract_products():
         frame = pd.read_csv(f"{DATA_DIR}/products.csv", dtype=str, keep_default_na=False)
+        _assert_required_columns(frame, "products.csv")
         print(f"[Extract] products.csv: {len(frame)} rows")
         return _json_records(frame)
 
     @task
     def extract_stores():
         frame = pd.read_csv(f"{DATA_DIR}/stores.csv", dtype=str, keep_default_na=False)
+        _assert_required_columns(frame, "stores.csv")
         print(f"[Extract] stores.csv: {len(frame)} rows")
         return _json_records(frame)
 
@@ -280,6 +312,11 @@ def nammamart_etl_rudin():
         order_delivery = pd.to_numeric(orders["delivery_minutes"], errors="coerce")
         expected_amount = (order_quantity * order_unit_price * (1 - order_discount / 100)).round(2)
         order_ts = pd.to_datetime(orders["order_ts"], errors="coerce")
+        product_mrp = pd.to_numeric(products.set_index("product_id")["mrp"], errors="coerce")
+        order_mrp = orders["product_id"].map(product_mrp)
+        price_distribution_drift = order_unit_price > (2 * order_mrp)
+        stale_cutoff = order_ts.max() - pd.Timedelta(days=30) if order_ts.notna().any() else pd.Timestamp.max
+        stale_orders = order_ts < stale_cutoff
         signup_date = pd.to_datetime(customers["signup_date"], errors="coerce")
         payment_paid = pd.to_numeric(payments["amount_paid"], errors="coerce")
         payment_expected = payments["order_id"].map(order_amounts).pipe(pd.to_numeric, errors="coerce")
@@ -306,6 +343,9 @@ def nammamart_etl_rudin():
                     failed_count(orders, ~orders.customer_id.isin(customer_ids), ~orders.product_id.isin(product_ids), ~orders.store_id.isin(store_ids)) + failed_count(payments, ~payments.order_id.isin(order_ids), payment_amount_mismatch), run_id, dag_id),
             _dq_row("delivery_normal_range", "Accuracy", "Warning", len(orders), failed_count(orders, order_delivery.notna() & (order_delivery > 35) & (order_delivery < 120)), run_id, dag_id),
             _dq_row("future_dates", "Timeliness", "Critical", len(orders) + len(customers), failed_count(orders, order_ts > pd.Timestamp("2026-10-09 23:59:59")) + failed_count(customers, signup_date > pd.Timestamp("2026-10-09")), run_id, dag_id),
+            _dq_row("order_volume_drop", "Volume", "Warning", len(orders), int(len(orders) < MINIMUM_ORDER_VOLUME), run_id, dag_id),
+            _dq_row("price_distribution_drift", "Distribution", "Warning", len(orders), failed_count(orders, price_distribution_drift), run_id, dag_id),
+            _dq_row("stale_orders", "Timeliness", "Warning", len(orders), failed_count(orders, stale_orders), run_id, dag_id),
         ]
         con = duckdb.connect(WAREHOUSE_DB)
         con.execute("""CREATE TABLE IF NOT EXISTS dq_results (

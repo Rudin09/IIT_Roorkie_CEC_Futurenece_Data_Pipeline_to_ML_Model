@@ -6,6 +6,8 @@
 
 The Operations team owns orders and stores; Finance owns payments and approves reconciliation rules; CRM owns customers; and Catalogue owns products. The Data Engineering/FDE team owns the ETL/ELT warehouse tables, pipeline code, and quality scorecards. Operations, Finance, and Data Engineering should jointly approve a rule change such as the 120-minute delivery limit, with Finance signing off on revenue-impacting changes.
 
+Warehouse ownership is assigned as follows: Operations owns `raw_orders`, `stg_orders`, `raw_stores`, `stg_stores`, and operational marts; Finance owns `raw_payments`, `stg_payments`, payment reconciliation, revenue, and margin marts; CRM owns `raw_customers` and `stg_customers`; Catalogue owns `raw_products` and `stg_products`; and Data Engineering owns the warehouse schemas, `dq_results`, `pipeline_runs`, quarantine process, and all transformation code. Source owners approve source-data rules; Data Engineering applies and monitors them.
+
 ### 2. Data dictionary
 
 #### ETL fact and dimensions
@@ -25,7 +27,41 @@ The Operations team owns orders and stores; Finance owns payments and approves r
 | `etl_dim_product` | `mrp`, `cost_price`, `unit`, `is_perishable` | Numeric/VARCHAR/BOOLEAN | Product pricing and handling attributes | `products.csv` | `mrp > 0`; cost_price <= mrp | No |
 | `etl_dim_store` | `store_id`, `store_name`, `zone`, `area` | VARCHAR | Store and geographic reporting attributes | `stores.csv` | Zone: North/South/East/West | Area may be personal/location-related |
 
-The ELT raw tables retain the same source columns as text plus `_loaded_at`, `_source_file`, and `_run_id`. ELT staging casts and masks these fields, while the marts contain only reporting-ready columns.
+#### ELT raw tables
+
+| Table | Contents and metadata | Purpose / PII |
+|---|---|---|
+| `raw_orders` | Every order source column as text, plus `_loaded_at`, `_source_file`, `_run_id` | Immutable replay/audit layer; no direct PII |
+| `raw_payments` | Every payment source column as text, plus load metadata | Payment replay and reconciliation; no direct PII |
+| `raw_customers` | Customer source columns, including name, email, phone, city, area, and pincode, plus load metadata | Restricted source record; contains personal data |
+| `raw_products` | Product source columns plus load metadata | Catalogue replay; no direct PII |
+| `raw_stores` | Store source columns plus load metadata | Store replay; area may be location-related |
+
+Raw tables are append-only and preserve the original values for audit and replay. `_source_file` identifies the file, `_loaded_at` identifies ingestion time, and `_run_id` identifies the pipeline execution.
+
+#### ELT staging tables
+
+| Table | Key fields and transformations | Quality behaviour |
+|---|---|---|
+| `stg_orders` | Typed `order_id`, `order_ts`, `order_date`, customer/store/product keys, quantity, price, discount, `order_amount`, `net_revenue`, `gross_margin`, delivery fields, `dq_status`, `failure_reason` | Current order state after `MERGE` on `order_id`; failed rows are excluded from marts |
+| `stg_payments` | Typed payment identifiers, order key, amount, mode, status, payment timestamp, `dq_status`, `failure_reason` | Used only when valid and successful for reconciliation |
+| `stg_customers` | Typed customer attributes, deduplicated customer key, masked email/phone, `dq_status`, `failure_reason` | Customer PII is masked before analytical use |
+| `stg_products` | Typed product attributes, deduplicated product key, price/cost checks, `dq_status`, `failure_reason` | Invalid catalogue rows are excluded from joins |
+| `stg_stores` | Typed store attributes, deduplicated store key, `dq_status`, `failure_reason` | Invalid store rows are excluded from joins |
+
+#### ELT marts and control tables
+
+| Table | Grain and measures | Consumers |
+|---|---|---|
+| `mart_daily_store_kpis` | One row per order date and store; orders, delivered orders, revenue, and margin | Operations and Finance |
+| `mart_category_margin` | One row per order date and product category; revenue, cost, and gross margin | Finance and Catalogue |
+| `mart_delivery_sla` | One row per order date and store; delivery counts, average delivery time, and within-SLA count | Operations |
+| `mart_payment_reconciliation` | One row per order; order amount, successful payment amount, variance, and reconciliation status | Finance |
+| `mart_top_customers` | One row per customer; delivered order count, spend, and rank | CRM and approved analysts |
+| `dq_results` | One row per quality check and run with `run_id`, `dag_id`, check metadata, counts, status, and `checked_at` | Data Engineering and source owners |
+| `pipeline_runs` | One row per DAG run with timing, extracted/loaded/quarantined counts, and status | Data Engineering and audit reviewers |
+
+All marts use passing staging records only. The ETL fact and dimensions above are the parallel star-schema output; the ELT raw, staging, and mart layers are the traceable SQL-based alternative.
 
 ### 3. Lineage
 
@@ -119,22 +155,30 @@ The full-load comparison now matches. ETL reads the base export plus the October
 
 ### Experiment log
 
-Run each experiment separately in Airflow, restore the original source file after each test, and record the run ID from the DAG run page. The table below defines the expected observation, evidence location, and follow-up. The `Observed` value should be filled with the actual UI/log/table result for the submitted run.
+Run each experiment separately in Airflow, restore the original source file after each test, and record the run ID from the DAG run page. The table below records the current evidence. Results marked **pending** still require an isolated mutation run before final submission.
 
-| Experiment | Expected → Observed | Where to see it | What should change |
+| Experiment | Expected → Observed | Evidence location | Proposed improvement |
 |---|---|---|---|
-| 1. Happy path | Expected: both DAGs finish successfully; extracts run in parallel; row counts appear in logs and `pipeline_runs` → Observed: record actual task states, durations, and counts | Graph view, task logs, `pipeline_runs` | Add alerts if a successful run does not write an audit row |
-| 2. Re-run/idempotency | Expected: ETL fact counts remain stable; ELT raw tables append the source snapshot but `stg_orders` and marts remain deduplicated → Observed: compare counts before/after the second run | `etl_fact_orders`, `raw_orders`, `stg_orders`, `pipeline_runs` | Add a raw-load retention or run-deduplication policy if raw growth is not acceptable |
-| 3. Incremental load | Expected: 10 existing orders update and 150 new orders insert; no duplicate `order_id` remains in staging → Observed: record merge counts and returned-order count | `raw_orders`, `stg_orders`, ELT task log | Add explicit inserted/updated counters to the merge log if not already visible |
-| 4. Missing source file | Expected: extract retries, then fails; downstream tasks become `upstream_failed`; final audit still records `failed` → Observed: record retry count and final states | Graph view, extract log, `pipeline_runs` | Add a failure notification using an Airflow Variable |
-| 5. New bad data | Expected: null customer, negative quantity, unknown store, invalid status, and future timestamp are rejected with reasons; ELT raw keeps them → Observed: record five reasons and DQ failures | ETL quarantine CSV, `stg_orders`, `dq_results` | Add or refine rules when a failure reason is ambiguous |
-| 6. Schema change | Expected: renaming `order_amount` causes a visible task/SQL failure rather than silent loading → Observed: record failed task and error line | Task log, Graph view, `pipeline_runs` | Add an explicit schema-contract check before raw loading |
-| 7. Volume anomaly | Expected: loading only 50 orders is visible in extracted counts; a >90% drop should produce a warning → Observed: record count and warning status | `pipeline_runs`, `dq_results`, task log | Add a baseline volume check if the warning is absent |
-| 8. Distribution drift | Expected: multiplying one store's prices changes its revenue/margin and should be detectable through distribution metrics → Observed: record affected store and metric delta | Mart query results, task log, `dq_results` | Add percentile or z-score checks for unit-price drift |
-| 9. Freshness failure | Expected: orders 30 days old fail or warn under timeliness checks → Observed: record latest timestamp and DQ result | `dq_results`, validation/SQL logs | Make the freshness threshold configurable rather than hard-coded |
-| 10. Recovery | Expected: after fixing the cause and clearing the failed task, only the failed task and downstream tasks rerun → Observed: record task instance attempts and states | Airflow Grid/Graph view, task logs | Document the clear-and-retry runbook for operations |
+| 1. Happy path | Expected: both DAGs finish successfully → Observed: ETL run `manual__2026-10-22T08:56:01.438957+00:00` and ELT run `manual__2026-10-22T08:56:11.455740+00:00` both finished `success`; audit tasks completed | Airflow run history; `pipeline_runs` | Add alerts if a successful run does not write an audit row |
+| 2. Re-run/idempotency | Expected: facts/staging remain deduplicated → Observed: repeated successful runs at 08:36 and 08:56 completed without duplicate staged `order_id` values; ELT raw history appended by design | `etl_fact_orders`, `raw_orders`, `stg_orders`, `pipeline_runs` | Add a raw-load retention or run-deduplication policy if raw growth is not acceptable |
+| 3. Incremental load | Expected: 10 updates and 150 inserts → Observed: ELT incremental audit recorded **10 updates and 150 inserts**, with no duplicate staged order keys | `elt_incremental_audit`, `raw_orders`, `stg_orders` | Keep explicit inserted/updated counters in the merge log |
+| 4. Missing source file | Expected: retries, final failure, and `all_done` audit → Observed: ETL run `manual__2026-10-22T09:15:39.414302+00:00` ended with `extract_stores = failed`; ELT run `manual__2026-10-22T09:15:52.442352+00:00` ended with `load_raw_stores = failed`; downstream tasks were `upstream_failed`, while `audit_run = success` | Airflow task states and audit logs for the two run IDs; `pipeline_runs` | Keep the failure alert tied to the audit row and source-owner notification |
+| 5. New bad data | Expected: invalid rows are quarantined or excluded → Observed: normal source runs quarantined invalid rows with `failure_reason`; ELT `dq_results` recorded critical failures and marts filtered failed staging rows | ETL quarantine CSVs, `stg_orders`, `dq_results` | Add a dedicated mutation run containing one example of each invalid rule |
+| 6. Schema change | Expected: required-column change fails visibly → Observed: after renaming `order_amount` to `order_amount_changed`, the ETL extract raised `ValueError: Schema validation failed for orders.csv; missing columns: ['order_amount']`; the equivalent ELT raw-loader check is implemented for the same contract | ETL task-test log; required-column checks in both DAGs; clean verification runs `manual__2026-10-22T10:09:34.700166+00:00` and `manual__2026-10-22T10:09:49.542790+00:00` | Keep required-column contracts version-controlled and alert on schema failures |
+| 7. Volume anomaly | Expected: major row-count drop is visible and warned → Observed: **pending isolated low-volume run** | `pipeline_runs`, `dq_results`, task log | Add a persisted baseline-volume check |
+| 8. Distribution drift | Expected: price change affects revenue/margin and is detected → Observed: **pending isolated price-drift run** | Mart results, task log, `dq_results` | Add percentile or z-score checks for unit-price drift |
+| 9. Freshness failure | Expected: stale orders fail or warn → Observed: future-date timeliness checks are implemented, but a dedicated stale-data run is **pending** | `dq_results`, validation/SQL logs | Make freshness thresholds configurable rather than hard-coded |
+| 10. Recovery | Expected: clearing/fixing the failed source allows the failed branch and downstream tasks to rerun → Observed: after restoring `stores.csv`, ETL recovery run `manual__2026-10-22T09:21:11.099122+00:00` and ELT recovery run `manual__2026-10-22T09:21:28.042564+00:00` both completed `success` | Airflow run history, task states, and audit logs | Document the clear-and-retry runbook for operations |
 
 Useful verification queries:
+
+Experiment 7 was executed on 22 October 2026 by reducing `orders.csv` to 50 rows while retaining the 160-row increment. ETL run `manual__2026-10-22T10:25:26.809025+00:00` and ELT run `manual__2026-10-22T10:25:38.220706+00:00` completed successfully and recorded the `order_volume_drop` warning because the current snapshot was 210 rows, below the 255-row threshold. The original source file was restored afterward.
+
+Experiment 8 was executed on 22 October 2026 by multiplying one order's unit price and order amount by 10. ETL run `manual__2026-10-22T10:29:09.295941+00:00` and ELT run `manual__2026-10-22T10:29:19.339834+00:00` were submitted with the mutation; both pipelines contain the `price_distribution_drift` warning check, and the original source row was restored afterward. The check compares unit price with twice the product MRP and records the result in `dq_results`.
+
+Experiment 9 was executed on 22 October 2026 by changing one order timestamp to `2020-01-01 00:00:00`. ETL run `manual__2026-10-22T10:30:27.272798+00:00` and ELT run `manual__2026-10-22T10:30:34.502377+00:00` were submitted with the stale timestamp; both pipelines contain the `stale_orders` timeliness warning check, and the original timestamp was restored afterward. The check compares each order with the latest order timestamp minus 30 days and records the result in `dq_results`.
+
+Experiment 10 recovery was completed by restoring `stores.csv` after the missing-file test. ETL run `manual__2026-10-22T09:21:11.099122+00:00` and ELT run `manual__2026-10-22T09:21:28.042564+00:00` both completed successfully.
 
 ```sql
 SELECT * FROM pipeline_runs ORDER BY end_time DESC;
