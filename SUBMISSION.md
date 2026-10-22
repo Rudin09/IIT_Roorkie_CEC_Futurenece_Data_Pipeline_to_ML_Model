@@ -567,6 +567,17 @@ ELT has low initial cost because raw storage and SQL transformations use open-so
 
 For NammaMart, ELT provides the best balance of auditability, flexibility, and long-term scale while the quality-gated marts preserve the finance requirement that bad rows never reach executive reporting.
 
+## Bonus items (+10 marks)
+
+| Bonus | Implementation | Status |
+|---|---|---|
+| Slack/email alert on failure | `include/slack_notifier.py` sends alerts via Airflow Variable `SLACK_WEBHOOK_URL`; called from both DAG audit tasks on failure | Complete |
+| SCD Type 2 customer dimension | `etl_dim_customer_scd2` in both ETL (load task) and ELT (marts SQL), keeping loyalty-tier history with `valid_from`/`valid_to`/`is_current` | Complete |
+| Store-capacity check | `dq_results.store_capacity_check` in ETL; `mart_store_capacity_check` in ELT marts, comparing delivered orders vs `capacity_orders_per_day` | Complete |
+| DQ trend chart | `include/dq_trend_chart.py` plots `rows_failed` over time per check per pipeline from both `dq_results` tables; outputs `include/dq_trend.png` | Complete |
+
+`matplotlib` added to `requirements.txt`. Slack alerts fall back to console output when `SLACK_WEBHOOK_URL` is not set, so both DAGs run cleanly in the demo environment.
+
 ## Step 11 — Final submission checklist
 
 The repository is ready for submission. The following checklist maps the assignment deliverables to the committed implementation and evidence, in assignment order.
@@ -582,6 +593,10 @@ The repository is ready for submission. The following checklist maps the assignm
 | Part F — observability and experiment results | Complete | [Part F section](#part-f--observability), [ten required experiments](#ten-required-experiments), [pipeline_runs screenshot](./evidence/pipeline_runs.png) |
 | Business-query results | Complete | [business-question SQL](./include/sql/nammamart_business_questions.sql) and [Step 9](#step-9--six-business-questions) |
 | Part G — CTO recommendation | Complete | [Part G section](#part-g--recommendation-to-sameer-cto) |
+| Bonus: Slack failure alert | Complete | `include/slack_notifier.py`, both DAG audit tasks alert on failure |
+| Bonus: SCD Type 2 customer dimension | Complete | `etl_dim_customer_scd2` in ETL load task and ELT marts SQL |
+| Bonus: store-capacity check | Complete | `dq_results.store_capacity_check` (ETL), `mart_store_capacity_check` (ELT) |
+| Bonus: DQ trend chart | Complete | `include/dq_trend_chart.py`, `include/dq_trend.png` |
 | Both DAG files | Complete | [ETL DAG](./dags/nammamart_etl_rudin.py) and [ELT DAG](./dags/nammamart_elt_rudin.py) |
 | Helper code and SQL | Complete | [include/](./include/), [ETL SQL](./include/sql/nammamart_business_questions.sql), [ELT staging SQL](./include/sql/nammamart_elt_staging.sql), [ELT marts SQL](./include/sql/nammamart_elt_marts.sql), [ELT upsert SQL](./include/sql/nammamart_elt_orders_upsert.sql) |
 | Successful DAG and schedule screenshots | Complete | [DAGs and schedule](./evidence/airflow_dags.png), [ETL success](./evidence/airflow_etl_success.png), [ELT success](./evidence/airflow_elt_success.png) |

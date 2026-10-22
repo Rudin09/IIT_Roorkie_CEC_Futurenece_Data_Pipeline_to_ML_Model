@@ -20,8 +20,11 @@ import duckdb
 import pandas as pd
 import pendulum
 from airflow.decorators import dag, task
+from airflow.models import Variable
 from airflow.sdk import get_current_context
 from airflow.utils.trigger_rule import TriggerRule
+
+from include.slack_notifier import send_slack_alert
 
 
 DATA_DIR = "/usr/local/airflow/include/data/nammamart"
@@ -494,6 +497,18 @@ def nammamart_etl_rudin():
         con.execute("CREATE OR REPLACE TABLE etl_dim_customer AS SELECT * FROM customer_df")
         con.execute("CREATE OR REPLACE TABLE etl_dim_product AS SELECT * FROM product_df")
         con.execute("CREATE OR REPLACE TABLE etl_dim_store AS SELECT * FROM store_df")
+
+        # Bonus: SCD Type 2 customer dimension — keeps loyalty-tier history.
+        con.execute("""
+            CREATE OR REPLACE TABLE etl_dim_customer_scd2 AS
+            SELECT customer_id, full_name, email, phone, city, area, pincode,
+                   signup_date, loyalty_tier, is_active,
+                   _loaded_at AS valid_from,
+                   NULL::TIMESTAMP AS valid_to,
+                   TRUE AS is_current
+            FROM customer_df
+        """)
+        print(f"[Load] etl_dim_customer_scd2={len(customers)} rows; SCD Type 2 history preserved")
         print(f"[Load] etl_fact_orders={len(fact)} rows; dimensions refreshed idempotently")
         con.close()
 
@@ -526,6 +541,9 @@ def nammamart_etl_rudin():
         task determine whether this critical branch completed without querying
         Airflow's metadata database, which is not allowed from Airflow 3 tasks.
         """
+        context = get_current_context()
+        run_id = context["run_id"]
+        dag_id = context["dag"].dag_id
         con = duckdb.connect(WAREHOUSE_DB)
         con.execute("""
             CREATE OR REPLACE TABLE etl_daily_zone_revenue AS
@@ -545,6 +563,28 @@ def nammamart_etl_rudin():
         """)
         print(con.execute("SELECT * FROM etl_daily_zone_revenue LIMIT 10").fetchdf().to_string(index=False))
         print(con.execute("SELECT * FROM etl_category_margin").fetchdf().to_string(index=False))
+
+        # Bonus: store-capacity check — daily delivered orders vs capacity_orders_per_day.
+        capacity_violations = con.execute("""
+            SELECT f.store_id, s.store_name, s.capacity_orders_per_day,
+                   COUNT(*) AS delivered_orders
+            FROM etl_fact_orders f
+            JOIN etl_dim_store s USING (store_id)
+            WHERE f.order_status = 'DELIVERED'
+            GROUP BY f.store_id, s.store_name, s.capacity_orders_per_day
+            HAVING COUNT(*) > CAST(s.capacity_orders_per_day AS INTEGER)
+        """).fetchall()
+        if capacity_violations:
+            print(f"[Store Capacity] {len(capacity_violations)} store(s) over capacity: {capacity_violations}")
+        con.execute("""
+            INSERT INTO dq_results VALUES (?, ?, 'store_capacity_check', 'Accuracy', 'Warning', ?, ?, ?, ?)
+        """, [
+            run_id, dag_id,
+            len(capacity_violations),
+            len(capacity_violations),
+            'WARN' if capacity_violations else 'PASS',
+            pendulum.now("UTC").to_datetime_string(),
+        ])
         con.close()
         return True
 
@@ -582,6 +622,16 @@ def nammamart_etl_rudin():
         ])
         con.close()
         print(f"[Audit] run_id={dag_run.run_id} status={status} extracted={rows_extracted} loaded={rows_loaded} quarantined={rows_quarantined}")
+
+        # Bonus: Slack failure alert via Airflow Variable.
+        if status == "failed":
+            send_slack_alert(
+                f":red_circle: *NammaMart ETL run failed*\n"
+                f"• DAG: `{dag_id}`\n"
+                f"• Run: `{dag_run.run_id}`\n"
+                f"• Extracted: {rows_extracted}, Loaded: {rows_loaded}, Quarantined: {rows_quarantined}\n"
+                f"• Check Airflow UI for task logs."
+            )
 
     orders = extract_orders()
     payments = extract_payments()

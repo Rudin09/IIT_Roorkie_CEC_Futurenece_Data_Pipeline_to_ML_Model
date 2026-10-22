@@ -18,8 +18,11 @@ import duckdb
 import pandas as pd
 import pendulum
 from airflow.decorators import dag, task
+from airflow.models import Variable
 from airflow.sdk import get_current_context
 from airflow.utils.trigger_rule import TriggerRule
+
+from include.slack_notifier import send_slack_alert
 
 
 DATA_DIR = "/usr/local/airflow/include/data/nammamart"
@@ -326,6 +329,16 @@ def nammamart_elt_rudin():
         ])
         con.close()
         print(f"[Audit] run_id={dag_run.run_id} status={status} extracted={rows_extracted} loaded={rows_loaded} rejected={rows_quarantined}")
+
+        # Bonus: Slack failure alert via Airflow Variable.
+        if status == "failed":
+            send_slack_alert(
+                f":red_circle: *NammaMart ELT run failed*\n"
+                f"• DAG: `{context['dag'].dag_id}`\n"
+                f"• Run: `{dag_run.run_id}`\n"
+                f"• Extracted: {rows_extracted}, Loaded: {rows_loaded}, Quarantined: {rows_quarantined}\n"
+                f"• Check Airflow UI for task logs."
+            )
 
     raw_orders = load_raw_orders()
     raw_payments = load_raw_payments()
