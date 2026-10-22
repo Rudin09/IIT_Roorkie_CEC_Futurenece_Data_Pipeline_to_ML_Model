@@ -286,3 +286,26 @@ ELT has low initial cost because raw storage and SQL transformations use open-so
 3. **Raw-table growth and late corrections could increase cost or confuse historical reporting.** Partition or compact raw storage, use incremental `MERGE` models, retain source/load metadata, and expose separate current-state and as-reported history views.
 
 For NammaMart, ELT provides the best balance of auditability, flexibility, and long-term scale while the quality-gated marts preserve the finance requirement that bad rows never reach executive reporting.
+
+## Step 11 — Final submission checklist
+
+The repository is ready for submission. The following checklist maps the assignment deliverables to the committed implementation and evidence.
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| Both DAG files | Complete | [ETL DAG](./dags/nammamart_etl_rudin.py) and [ELT DAG](./dags/nammamart_elt_rudin.py) |
+| Helper code and SQL | Complete | [include/](./include/), [ETL SQL](./include/sql/nammamart_business_questions.sql), [ELT staging SQL](./include/sql/nammamart_elt_staging.sql), [ELT marts SQL](./include/sql/nammamart_elt_marts.sql), [ELT upsert SQL](./include/sql/nammamart_elt_orders_upsert.sql) |
+| Profiling and issues log | Complete | [profile report](./assignment/profile/PROFILE_REPORT.md), [issues log](./assignment/profile/data_issues_log.csv), [client questions](./assignment/profile/client_questions.csv) |
+| Business-query results | Complete | [business-question SQL](./include/sql/nammamart_business_questions.sql) and [Step 9](#step-9--six-business-questions) |
+| Governance answers | Complete | [Step 6 governance section](#step-6--data-governance) |
+| Observability and experiment results | Complete | [Step 7 observability section](#step-7--observability-and-run-auditing) and [Step 8 experiments](#step-8--ten-required-experiments) |
+| CTO recommendation | Complete | [Step 10 recommendation](#part-g--recommendation-to-sameer-cto) |
+| Successful DAG and schedule screenshots | Complete | [DAGs and schedule](./evidence/airflow_dags.png), [ETL success](./evidence/airflow_etl_success.png), [ELT success](./evidence/airflow_elt_success.png) |
+| Quarantine, DQ, audit, and reconciliation screenshots | Complete | [quarantine](./evidence/quarantine.png), [dq_results](./evidence/dq_results.png), [pipeline_runs](./evidence/pipeline_runs.png), [payment reconciliation](./evidence/payment_reconciliation.png) |
+| No committed secrets or unauthorized unmasked customer data | Complete with control | Secret references use Airflow Variables/secret storage; no literal API keys or webhook credentials were found. Reporting outputs mask email and phone fields; raw assignment inputs remain access-controlled source data and are not selected by business queries. |
+
+### Final run evidence
+
+The final full-load validation completed successfully for both DAGs. ETL run `manual__2026-10-22T11:26:30.558523+00:00` recorded 5,350 extracted, 2,087 loaded, and 149 quarantined rows. ELT run `manual__2026-10-22T11:26:57.475476+00:00` recorded 5,372 extracted, 2,555 loaded, and 490 quarantined rows. Both runs completed their audit tasks, and both DAGs are scheduled with `0 9 * * 1-6`; Airflow displays the next 9:00 AM Asia/Kolkata run as 03:30 UTC.
+
+The evidence package proves the required control chain: source rows are profiled, rejected rows retain reasons, quality checks are persisted in `dq_results`, run metrics are persisted in `pipeline_runs`, reconciliations are visible, and only quality-gated data reaches reporting marts. The final report is therefore accurate within the documented source-version/reconciliation caveat, repeatable through idempotent runs, explainable through lineage and quality logs, observable through audit tables and screenshots, and safe through masked reporting fields and externalized secrets.
