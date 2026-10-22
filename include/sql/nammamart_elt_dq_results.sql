@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS dq_results (
 INSERT INTO dq_results
 SELECT '{{ run_id }}', '{{ dag_id }}', check_name, dimension, severity,
        rows_checked, rows_failed,
-       CASE WHEN rows_failed = 0 THEN 'PASS' ELSE 'FAIL' END,
+       CASE WHEN rows_failed = 0 THEN 'PASS'
+            WHEN severity = 'Warning' THEN 'WARN'
+            ELSE 'FAIL' END,
        CURRENT_TIMESTAMP
 FROM (
     SELECT 'stg_orders_quality' AS check_name, 'Validity' AS dimension, 'Critical' AS severity,
