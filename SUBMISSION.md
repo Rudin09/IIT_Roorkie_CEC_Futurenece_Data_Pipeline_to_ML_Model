@@ -87,17 +87,18 @@ Both DAGs were rerun successfully on 22 October 2026:
 
 | DAG | Run ID | Status | Rows extracted | Rows loaded | Rows quarantined |
 |---|---|---|---:|---:|---:|
-| `nammamart_etl_rudin` | `manual__2026-10-22T08:26:57.782615+00:00` | success | 5,350 | 2,087 | 149 |
-| `nammamart_elt_rudin` | `manual__2026-10-22T08:27:08.281051+00:00` | success | 5,372 | 2,550 | 486 |
+| `nammamart_etl_rudin` | `manual__2026-10-22T08:36:14.418459+00:00` | success | 5,350 | 2,087 | 149 |
+| `nammamart_elt_rudin` | `manual__2026-10-22T08:36:24.460018+00:00` | success | 5,372 | 2,550 | 484 |
 
 The ELT incremental audit records **150 inserts and 10 updates** for `orders_2026-10-01_increment.csv`. Staging contains 2,550 unique orders and no duplicate `order_id` values.
 
-Both derived warehouses were reset and fully reloaded from the source snapshot. The September source data remains available for the required historical reporting, while reconciliation is scoped to October only. Source CSVs remain untouched; the clean full load also rebuilt raw ELT tables, quarantine outputs, audit history, and quality logs.
+Both derived warehouses were reset and fully reloaded from the source snapshot. The September source data remains available for historical reporting, and both September and October reconciliation tables are now persisted. Source CSVs remain untouched; the clean full load also rebuilt raw ELT tables, quarantine outputs, audit history, and quality logs.
 
-The comparison scope is now October delivered revenue:
+The full-load reconciliation results are:
 
 | Metric | ETL orders | ELT orders | ETL revenue | ELT revenue | Status |
 |---|---:|---:|---:|---:|---|
+| September delivered revenue | 1,768 | 1,768 | 956,731.20 | 956,731.20 | MATCH |
 | October delivered revenue | 128 | 128 | 68,798.20 | 68,798.20 | MATCH |
 
 The full-load comparison now matches. ETL reads the base export plus the October incremental file, applies incremental rows as the latest version for each `order_id`, and publishes 128 valid October delivered orders worth 68,798.20. ELT publishes the same 128 orders and revenue. The one previously inconsistent future-dated order is rejected by both pipelines under the aligned `2026-10-09` cutoff.

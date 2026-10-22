@@ -80,7 +80,7 @@ WITH ranked AS (
 ), typed AS (
     SELECT NULLIF(TRIM(payment_id), '') AS payment_id, NULLIF(TRIM(order_id), '') AS order_id,
            TRY_CAST(NULLIF(TRIM(payment_ts), '') AS TIMESTAMP) AS payment_ts,
-           CASE LOWER(TRIM(payment_mode)) WHEN 'upi' THEN 'UPI' WHEN 'cod' THEN 'Cash on Delivery' WHEN 'cash on delivery' THEN 'Cash on Delivery' ELSE TRIM(payment_mode) END AS payment_mode,
+           CASE LOWER(TRIM(payment_mode)) WHEN 'upi' THEN 'UPI' WHEN 'card' THEN 'Card' WHEN 'cod' THEN 'Cash on Delivery' WHEN 'cash on delivery' THEN 'Cash on Delivery' WHEN 'wallet' THEN 'Wallet' ELSE TRIM(payment_mode) END AS payment_mode,
            TRY_CAST(NULLIF(TRIM(amount_paid), '') AS DECIMAL(12, 2)) AS amount_paid,
            UPPER(TRIM(payment_status)) AS payment_status, NULLIF(TRIM(gateway_ref), '') AS gateway_ref,
            _loaded_at, _source_file, _run_id
@@ -104,7 +104,7 @@ WITH source_rows AS (
            TRY_CAST(NULLIF(TRIM(unit_price), '') AS DECIMAL(12, 2)) AS unit_price,
            TRY_CAST(NULLIF(TRIM(discount_pct), '') AS DECIMAL(6, 2)) AS discount_pct,
            TRY_CAST(NULLIF(TRIM(order_amount), '') AS DECIMAL(12, 2)) AS order_amount,
-           CASE LOWER(TRIM(payment_mode)) WHEN 'upi' THEN 'UPI' WHEN 'cod' THEN 'Cash on Delivery' WHEN 'cash on delivery' THEN 'Cash on Delivery' ELSE TRIM(payment_mode) END AS payment_mode,
+           CASE LOWER(TRIM(payment_mode)) WHEN 'upi' THEN 'UPI' WHEN 'card' THEN 'Card' WHEN 'cod' THEN 'Cash on Delivery' WHEN 'cash on delivery' THEN 'Cash on Delivery' WHEN 'wallet' THEN 'Wallet' ELSE TRIM(payment_mode) END AS payment_mode,
            UPPER(TRIM(order_status)) AS order_status, TRIM(channel) AS channel,
            TRY_CAST(NULLIF(TRIM(delivery_minutes), '') AS INTEGER) AS delivery_minutes,
            _loaded_at, _source_file, _run_id, source_duplicate_versions

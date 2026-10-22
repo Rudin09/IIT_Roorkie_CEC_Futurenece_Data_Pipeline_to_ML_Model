@@ -180,7 +180,34 @@ def nammamart_elt_rudin():
         context = get_current_context()
         con = duckdb.connect(WAREHOUSE_DB)
         con.execute(f"ATTACH '{ETL_WAREHOUSE_DB}' AS etl_db (READ_ONLY)")
-        con.execute("DROP TABLE IF EXISTS elt_etl_september_reconciliation")
+        con.execute("""
+            CREATE OR REPLACE TABLE elt_etl_september_reconciliation AS
+            SELECT
+                'September delivered revenue' AS metric,
+                (SELECT COUNT(*) FROM etl_db.etl_fact_orders
+                 WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) < DATE '2026-10-01') AS etl_order_count,
+                (SELECT COUNT(*) FROM stg_orders
+                 WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                   AND CAST(order_date AS DATE) < DATE '2026-10-01') AS elt_order_count,
+                (SELECT SUM(net_revenue) FROM etl_db.etl_fact_orders
+                 WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) < DATE '2026-10-01') AS etl_value,
+                (SELECT SUM(net_revenue) FROM stg_orders
+                 WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                   AND CAST(order_date AS DATE) < DATE '2026-10-01') AS elt_value,
+                (SELECT SUM(net_revenue) FROM stg_orders
+                 WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                   AND CAST(order_date AS DATE) < DATE '2026-10-01')
+                - (SELECT SUM(net_revenue) FROM etl_db.etl_fact_orders
+                   WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) < DATE '2026-10-01') AS difference,
+                CASE WHEN ABS(
+                    (SELECT SUM(net_revenue) FROM stg_orders
+                     WHERE dq_status = 'PASS' AND order_status = 'DELIVERED'
+                       AND CAST(order_date AS DATE) < DATE '2026-10-01')
+                    - (SELECT SUM(net_revenue) FROM etl_db.etl_fact_orders
+                       WHERE order_status = 'DELIVERED' AND CAST(order_date AS DATE) < DATE '2026-10-01')
+                ) < 0.01 THEN 'MATCH' ELSE 'MISMATCH' END AS comparison_status,
+                CURRENT_TIMESTAMP AS compared_at
+        """)
         con.execute("""
             CREATE OR REPLACE TABLE elt_etl_october_reconciliation AS
             SELECT
@@ -221,6 +248,7 @@ def nammamart_elt_rudin():
                 ) < 0.01 THEN 'MATCH' ELSE 'MISMATCH' END AS comparison_status,
                 CURRENT_TIMESTAMP AS compared_at
         """)
+        print(con.execute("SELECT * FROM elt_etl_september_reconciliation").fetchdf().to_string(index=False))
         print(con.execute("SELECT * FROM elt_etl_october_reconciliation").fetchdf().to_string(index=False))
         con.close()
         return marts_complete
